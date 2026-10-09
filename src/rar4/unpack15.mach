@@ -1,0 +1,565 @@
+# RAR 1.5 decompression (unpack version 15, written by RAR 1.5x)
+#
+# a 64 KB LZ window with no transmitted tables. a flag byte, itself read
+# through an adaptive table, says for each step whether a literal, a long
+# match or a short match follows; which of the two first kinds is "expected"
+# moves with how literals and matches have been weighted lately. literals,
+# long-match distances and short-match distances are each coded through one
+# of several fixed prefix codes, picked by a running average, and then
+# mapped through adaptive move-toward-front tables. long runs of literals
+# switch to a "stored" mode.
+#
+# written from the format as The Unarchiver's XADMaster (LGPL-2.1) decodes
+# it, read only; the fixed code tables are restated here as runs of code
+# lengths. see docs/clean-room-notes.md.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use E:  ramjet.errors;
+use HF: ramjet.huffman;
+use M:  ramjet.mem;
+use BI: ramjet.rar4.bitin;
+use S:  ramjet.stream;
+
+val WINDOW: u64 = 0x10000;
+
+# a short fixed code given as explicit bit strings, at most 15 entries
+rec Small {
+    n:    usize;
+    code: [15]u32;
+    len:  [15]u32;
+}
+
+pub rec Unpacker {
+    window:     *u8;
+    pos:        u64;
+    flushed:    u64;
+    file_start: u64;
+    file_end:   u64;
+    stream_end: u64;
+
+    # fixed codes
+    len1:  HF.Huff;
+    len2:  HF.Huff;
+    h0:    HF.Huff;
+    h1:    HF.Huff;
+    h2:    HF.Huff;
+    h3:    HF.Huff;
+    h4:    HF.Huff;
+    sm0:   Small;
+    sm1:   Small;
+    sm2:   Small;
+    sm3:   Small;
+    codes: bool;
+
+    # adaptive state
+    stored:        bool;
+    flags:         u32;
+    flag_bits:     u32;
+    lit_weight:    u32;
+    match_weight:  u32;
+    rep_literals:  u32;
+    rep_matches:   u32;
+    avg_literal:   u32;
+    avg_selector:  u32;
+    avg_length:    u32;
+    avg_offset:    u32;
+    avg_below_max: u32;
+    max_offset:    u32;
+    bugfix:        bool;
+
+    last_dist: u64;
+    last_len:  u64;
+    old_dist:  [4]u64;
+    old_idx:   u32;
+
+    flag_table:    [256]u32;
+    flag_rev:      [256]u32;
+    lit_table:     [256]u32;
+    lit_rev:       [256]u32;
+    off_table:     [256]u32;
+    off_rev:       [256]u32;
+    short_offsets: [256]u32;
+
+    broken: bool;
+    bi:     BI.BitIn;
+}
+
+# ---------------------------------------------------------------- codes
+
+# a prefix code from runs of (length, count)
+fun build_runs(h: *HF.Huff, runs: *u32, nruns: usize, n: usize) {
+    var lens: [257]u8;
+    var k:    usize = 0;
+    var r:    usize = 0;
+    for (r < nruns) {
+        var c: u32 = runs[r * 2 + 1];
+        for (c > 0 && k < n) {
+            lens[k] = runs[r * 2]::u8;
+            k       = k + 1;
+            c       = c - 1;
+        }
+        r = r + 1;
+    }
+    HF.build(h, ?lens[0], n);
+}
+
+# a short code from bit strings written as text, value i taking codes[i]
+fun build_small(s: *Small, text: *u8) {
+    s.n = 0;
+    var i: usize = 0;
+    for (text[i] != 0) {
+        var code: u32 = 0;
+        var len:  u32 = 0;
+        for (text[i] == '0' || text[i] == '1') {
+            code = (code << 1) | (text[i] - '0')::u32;
+            len  = len + 1;
+            i    = i + 1;
+        }
+        s.code[s.n] = code;
+        s.len[s.n]  = len;
+        s.n         = s.n + 1;
+        if (text[i] == ' ') { i = i + 1; }
+    }
+}
+
+fun build_codes(u: *Unpacker) {
+    if (u.codes) { ret; }
+    var r: [20]u32;
+    # literal and offset codes; lengths in runs of (bits, symbols)
+    r = [20]u32{2, 2, 3, 1, 4, 2, 5, 2, 6, 4, 7, 5, 8, 4, 9, 4, 10, 8, 12, 224};
+    build_runs(?u.len1, ?r[0], 10, 256);
+    r = [20]u32{3, 5, 4, 2, 5, 2, 6, 4, 7, 5, 8, 4, 9, 4, 10, 8, 11, 2, 12, 220};
+    build_runs(?u.len2, ?r[0], 10, 256);
+    r = [20]u32{4, 8, 5, 8, 6, 8, 7, 9, 12, 224, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    build_runs(?u.h0, ?r[0], 5, 257);
+    r = [20]u32{5, 4, 6, 40, 7, 16, 8, 16, 9, 4, 11, 47, 12, 130, 0, 0, 0, 0, 0, 0};
+    build_runs(?u.h1, ?r[0], 7, 257);
+    r = [20]u32{5, 2, 6, 5, 7, 46, 8, 64, 9, 116, 10, 24, 0, 0, 0, 0, 0, 0, 0, 0};
+    build_runs(?u.h2, ?r[0], 6, 257);
+    r = [20]u32{6, 2, 7, 14, 8, 202, 9, 33, 10, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    build_runs(?u.h3, ?r[0], 5, 257);
+    r = [20]u32{8, 255, 9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    build_runs(?u.h4, ?r[0], 2, 257);
+    # short match length selectors
+    build_small(?u.sm0, "0 1010 1101 1110 11110 111110 1111110 11111110 11111111 1100 1000 10010 100110 100111 1011"::*u8);
+    build_small(?u.sm1, "0 101 1101 1110 11110 111110 1111110 11111110 11111111 1100 1000 10010 100110 100111"::*u8);
+    build_small(?u.sm2, "00 010 011 1010 1101 1110 11110 111110 111111 1100 1000 10010 100110 100111 1011"::*u8);
+    build_small(?u.sm3, "00 010 011 101 1101 1110 11110 111110 111111 1100 1000 10010 100110 100111"::*u8);
+    u.codes = true;
+}
+
+fun decode(u: *Unpacker, h: *HF.Huff) u32 {
+    val r: u32 = HF.lookup(h, BI.peek16(?u.bi));
+    BI.skip(?u.bi, r >> 16);
+    ret r & 0xFFFF;
+}
+
+fun decode_small(u: *Unpacker, s: *Small) u32 {
+    val bits: u32   = BI.peek16(?u.bi);
+    var i:    usize = 0;
+    for (i < s.n) {
+        if ((bits >> (16 - s.len[i])) == s.code[i]) {
+            BI.skip(?u.bi, s.len[i]);
+            ret i::u32;
+        }
+        i = i + 1;
+    }
+    ret 0xFFFF;
+}
+
+fun bit(u: *Unpacker) u32 {
+    ret BI.bits(?u.bi, 1);
+}
+
+# ---------------------------------------------------------------- adaptive tables
+
+# each entry holds a value (high bits) and a use count (low byte); a lookup
+# swaps the entry toward the front of its count group and counts the use.
+# when a count reaches `limit` every count is reset by position.
+fun reset_table(table: *u32, rev: *u32) {
+    var i: u32 = 0;
+    for (i < 8) {
+        var j: u32 = 0;
+        for (j < 32) {
+            val k: usize = (i * 32 + j)::usize;
+            table[k] = (table[k] & ~0xFF::u32) | (7 - i);
+            j        = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 256) {
+        rev[i::usize] = 0;
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < 7) {
+        rev[i::usize] = (7 - i) * 32;
+        i             = i + 1;
+    }
+}
+
+fun lookup_byte(table: *u32, rev: *u32, limit: u32, index: u32) u32 {
+    var v:     u32 = table[index::usize];
+    var other: u32 = rev[(v & 0xFF)::usize];
+    rev[(v & 0xFF)::usize] = other + 1;
+    if ((v & 0xFF) >= limit) {
+        reset_table(table, rev);
+        v                      = table[index::usize];
+        other                  = rev[(v & 0xFF)::usize];
+        rev[(v & 0xFF)::usize] = other + 1;
+    }
+    table[index::usize]          = table[(other & 0xFF)::usize];
+    table[(other & 0xFF)::usize] = v + 1;
+    ret v >> 8;
+}
+
+# ---------------------------------------------------------------- state
+
+pub fun init(u: *Unpacker) {
+    u.window = nil;
+    u.bi.buf = nil;
+    u.codes  = false;
+    u.broken = false;
+    reset(u);
+}
+
+fun reset(u: *Unpacker) {
+    u.pos           = 0;
+    u.flushed       = 0;
+    u.stream_end    = 0;
+    u.rep_literals  = 0;
+    u.bugfix        = false;
+    u.avg_selector  = 0;
+    u.avg_literal   = 0x3500;
+    u.avg_length    = 0;
+    u.avg_offset    = 0;
+    u.avg_below_max = 0;
+    u.max_offset    = 0x2001;
+    u.lit_weight    = 0x80;
+    u.match_weight  = 0x80;
+    var i: u32 = 0;
+    for (i < 256) {
+        u.flag_table[i::usize]    = ((0 - i) & 0xFF) << 8;
+        u.lit_table[i::usize]     = i << 8;
+        u.off_table[i::usize]     = i << 8;
+        u.short_offsets[i::usize] = i;
+        u.flag_rev[i::usize]      = 0;
+        u.lit_rev[i::usize]       = 0;
+        i                         = i + 1;
+    }
+    reset_table(?u.off_table[0], ?u.off_rev[0]);
+    u.last_dist   = 0;
+    u.last_len    = 0;
+    u.old_dist[0] = 0;
+    u.old_dist[1] = 0;
+    u.old_dist[2] = 0;
+    u.old_dist[3] = 0;
+    u.old_idx     = 0;
+}
+
+pub fun dnit(u: *Unpacker) {
+    if (u.window != nil) { M.free(u.window, WINDOW::usize); }
+    u.window = nil;
+    BI.dnit(?u.bi);
+}
+
+# ---------------------------------------------------------------- output
+
+fun put(u: *Unpacker, b: u8) {
+    u.window[(u.pos & (WINDOW - 1))::usize] = b;
+    u.pos                                   = u.pos + 1;
+}
+
+fun copy_match(u: *Unpacker, dist: u64, len: u64) {
+    val mask: u64 = WINDOW - 1;
+    var n:    u64 = 0;
+    for (n < len) {
+        u.window[((u.pos + n) & mask)::usize] = u.window[((u.pos + n - dist) & mask)::usize];
+        n                                     = n + 1;
+    }
+    u.pos = u.pos + len;
+}
+
+fun flush(u: *Unpacker, sink: *S.Sink) {
+    var a: u64 = u.flushed;
+    var b: u64 = u.pos;
+    if (b > u.file_end) { b = u.file_end; }
+    for (a < b) {
+        val off: u64 = a & (WINDOW - 1);
+        var n:   u64 = b - a;
+        if (n > WINDOW - off) { n = WINDOW - off; }
+        S.sink_write(sink, ?u.window[off::usize], n::usize);
+        a = a + n;
+    }
+    u.flushed = u.pos;
+}
+
+fun remember(u: *Unpacker, dist: u64, len: u64) {
+    u.last_dist                        = dist;
+    u.old_dist[(u.old_idx & 3)::usize] = dist;
+    u.old_idx                          = u.old_idx + 1;
+    u.last_len                         = len;
+}
+
+# ---------------------------------------------------------------- steps
+
+fun flag_bit(u: *Unpacker) i32 {
+    if (u.flag_bits == 0) {
+        val idx: u32 = decode(u, ?u.h2);
+        if (idx >= 256) { ret -1; }
+        u.flags     = lookup_byte(?u.flag_table[0], ?u.flag_rev[0], 0xFF, idx);
+        u.flag_bits = 8;
+    }
+    u.flag_bits = u.flag_bits - 1;
+    ret ((u.flags >> u.flag_bits) & 1)::i32;
+}
+
+fun literal(u: *Unpacker) E.Code {
+    var idx: u32 = 0;
+    if (u.avg_literal < 0xE00)  { idx = decode(u, ?u.h0); }
+    or (u.avg_literal < 0x3600) { idx = decode(u, ?u.h1); }
+    or (u.avg_literal < 0x5E00) { idx = decode(u, ?u.h2); }
+    or (u.avg_literal < 0x7600) { idx = decode(u, ?u.h3); }
+    or                          { idx = decode(u, ?u.h4); }
+    if (idx > 256)              { ret E.BAD_DATA; }
+
+    if (u.stored) {
+        if (idx == 0) {
+            if (bit(u) != 0) {
+                # back to normal coding
+                u.stored       = false;
+                u.rep_literals = 0;
+                ret E.OK;
+            }
+            var len: u64 = 3;
+            if (bit(u) != 0) { len = 4; }
+            val hi: u32 = decode(u, ?u.h2);
+            if (hi > 256) { ret E.BAD_DATA; }
+            val dist: u64 = ((hi << 5) | BI.bits(?u.bi, 5))::u64;
+            copy_match(u, dist, len);
+            ret E.OK;
+        }
+        idx = idx - 1;
+    }
+    or {
+        idx = idx & 0xFF;
+        val runs: u32 = u.rep_literals;
+        u.rep_literals = runs + 1;
+        if (runs >= 16 && u.flag_bits == 0) { u.stored = true; }
+    }
+
+    u.avg_literal = u.avg_literal + idx;
+    u.avg_literal = u.avg_literal - (u.avg_literal >> 8);
+    u.lit_weight  = u.lit_weight + 16;
+    if (u.lit_weight > 0xFF) {
+        u.lit_weight   = 0x90;
+        u.match_weight = u.match_weight >> 1;
+    }
+    put(u, lookup_byte(?u.lit_table[0], ?u.lit_rev[0], 0xA1, idx)::u8);
+    ret E.OK;
+}
+
+fun long_match(u: *Unpacker) E.Code {
+    u.rep_literals = 0;
+    u.match_weight = u.match_weight + 16;
+    if (u.match_weight > 0xFF) {
+        u.match_weight = 0x90;
+        u.lit_weight   = u.lit_weight >> 1;
+    }
+
+    var raw: u32 = 0;
+    if (u.avg_length >= 122) { raw = decode(u, ?u.len2); }
+    or (u.avg_length >= 64)  { raw = decode(u, ?u.len1); }
+    or {
+        # unary up to 8, then 8 literal bits
+        for (raw < 8 && bit(u) == 0) { raw = raw + 1; }
+        if (raw == 8) { raw = BI.bits(?u.bi, 8); }
+    }
+    if (raw > 255) { ret E.BAD_DATA; }
+
+    var oidx: u32 = 0;
+    if (u.avg_offset < 0x700)  { oidx = decode(u, ?u.h0); }
+    or (u.avg_offset < 0x2900) { oidx = decode(u, ?u.h1); }
+    or                         { oidx = decode(u, ?u.h2); }
+    if (oidx >= 256)           { ret E.BAD_DATA; }
+
+    val dist: u32 = (lookup_byte(?u.off_table[0], ?u.off_rev[0], 0xFF, oidx) << 7) | BI.bits(?u.bi, 7);
+    var len:  u32 = raw + 3;
+    if (dist >= u.max_offset) { len = len + 1; }
+    if (dist <= 256)          { len = len + 8; }
+
+    val old_max: u32 = u.max_offset;
+    if (u.avg_below_max > 0xB0 || (u.avg_literal >= 0x2A00 && u.avg_length < 0x40)) { u.max_offset = 0x7F00; }
+    or                                                                              { u.max_offset = 0x2001; }
+
+    u.avg_length = u.avg_length + raw;
+    u.avg_length = u.avg_length - (u.avg_length >> 5);
+    u.avg_offset = u.avg_offset + oidx;
+    u.avg_offset = u.avg_offset - (u.avg_offset >> 8);
+
+    if (raw == 0 && dist <= old_max) {
+        u.avg_below_max = u.avg_below_max + 1;
+        u.avg_below_max = u.avg_below_max - (u.avg_below_max >> 8);
+    }
+    or (raw != 1 && raw != 4) {
+        if (u.avg_below_max > 0) { u.avg_below_max = u.avg_below_max - 1; }
+    }
+
+    remember(u, dist::u64, len::u64);
+    copy_match(u, dist::u64, len::u64);
+    ret E.OK;
+}
+
+fun short_match(u: *Unpacker) E.Code {
+    u.rep_literals = 0;
+    if (u.rep_matches == 2) {
+        if (bit(u) != 0) {
+            copy_match(u, u.last_dist, u.last_len);
+            ret E.OK;
+        }
+        u.rep_matches = 0;
+    }
+
+    var sel_: u32 = 0;
+    if (u.avg_selector < 37) {
+        if (u.bugfix) { sel_ = decode_small(u, ?u.sm0); }
+        or            { sel_ = decode_small(u, ?u.sm1); }
+    }
+    or {
+        if (u.bugfix) { sel_ = decode_small(u, ?u.sm2); }
+        or            { sel_ = decode_small(u, ?u.sm3); }
+    }
+    if (sel_ == 0xFFFF) { ret E.BAD_DATA; }
+
+    if (sel_ < 9) {
+        u.rep_matches  = 0;
+        u.avg_selector = u.avg_selector + sel_;
+        u.avg_selector = u.avg_selector - (u.avg_selector >> 4);
+        val oidx: u32 = decode(u, ?u.h2) & 0xFF;
+        var dist: u32 = u.short_offsets[oidx::usize];
+        if (oidx != 0) {
+            # move the distance one place toward the front
+            u.short_offsets[oidx::usize]       = u.short_offsets[(oidx - 1)::usize];
+            u.short_offsets[(oidx - 1)::usize] = dist;
+        }
+        dist = dist + 1;
+        val len: u64 = (sel_ + 2)::u64;
+        remember(u, dist::u64, len);
+        copy_match(u, dist::u64, len);
+        ret E.OK;
+    }
+    if (sel_ == 9) {
+        u.rep_matches = u.rep_matches + 1;
+        copy_match(u, u.last_dist, u.last_len);
+        ret E.OK;
+    }
+    if (sel_ < 14) {
+        u.rep_matches = 0;
+        val dist: u64 = u.old_dist[((u.old_idx - (sel_ - 9)) & 3)::usize];
+        val lc:   u32 = decode(u, ?u.len1);
+        if (lc > 255) { ret E.BAD_DATA; }
+        var len: u64 = lc::u64 + 2;
+        if (len == 0x101 && sel_ == 10) {
+            # this combination toggles the alternate short codes
+            u.bugfix = !u.bugfix;
+            ret E.OK;
+        }
+        if (dist > 256)                { len = len + 1; }
+        if (dist >= u.max_offset::u64) { len = len + 1; }
+        remember(u, dist, len);
+        copy_match(u, dist, len);
+        ret E.OK;
+    }
+    # 14: a far match
+    u.rep_matches = 0;
+    val lc: u32 = decode(u, ?u.len2);
+    if (lc > 255) { ret E.BAD_DATA; }
+    val len:  u64 = lc::u64 + 5;
+    val dist: u64 = BI.bits(?u.bi, 15)::u64 + 0x8000;
+    u.last_dist = dist;
+    u.last_len  = len;
+    copy_match(u, dist, len);
+    ret E.OK;
+}
+
+fun step(u: *Unpacker) E.Code {
+    if (u.stored) { ret literal(u); }
+    val expect_match: bool = u.match_weight > u.lit_weight;
+    val f1:           i32  = flag_bit(u);
+    if (f1 < 0) { ret E.BAD_DATA; }
+    if (f1 == 1) {
+        if (expect_match) { ret long_match(u); }
+        ret literal(u);
+    }
+    val f2: i32 = flag_bit(u);
+    if (f2 < 0) { ret E.BAD_DATA; }
+    if (f2 == 1) {
+        if (!expect_match) { ret long_match(u); }
+        ret literal(u);
+    }
+    ret short_match(u);
+}
+
+# decompress one file
+# ---
+# unp_size: bytes the file unpacks to
+# known:    false when the size is unknown and the input end decides
+# solid:    continue the previous file's window and adaptive state
+pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: bool, solid: bool) E.Code {
+    build_codes(u);
+    if (u.window == nil) {
+        u.window = M.alloc(WINDOW::usize);
+        if (u.window == nil) { ret E.NO_MEMORY; }
+    }
+    if (solid) {
+        if (u.broken) { ret E.SOLID_BROKEN; }
+    }
+    or {
+        reset(u);
+        u.broken = false;
+    }
+    if (!BI.init(?u.bi, p)) { ret E.NO_MEMORY; }
+    # every file starts with fresh flag and stored-mode state
+    u.flag_bits   = 0;
+    u.stored      = false;
+    u.rep_matches = 0;
+    u.file_start  = u.stream_end;
+    u.flushed     = u.file_start;
+    if (known) { u.file_end = u.file_start + unp_size; }
+    or         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
+
+    var rc: E.Code = E.OK;
+    for (rc == E.OK && u.pos < u.file_end) {
+        if (u.pos - u.flushed >= WINDOW - 0x1000) { flush(u, sink); }
+        if (BI.exhausted(?u.bi)) {
+            if (known) { rc = E.TRUNCATED; }
+            brk;
+        }
+        rc = step(u);
+    }
+    if (rc == E.OK)                                { flush(u, sink); }
+    if (rc == E.OK && known && u.pos < u.file_end) { rc = E.TRUNCATED; }
+    if (known)                                     { u.stream_end = u.file_end; }
+    or                                             { u.stream_end = u.pos; }
+    if (rc != E.OK)                                { u.broken = true; }
+    ret rc;
+}
+
+test unpack15__adaptive_table {
+    # a fresh offset table hands out values in order and keeps them findable
+    var t: [256]u32;
+    var r: [256]u32;
+    var i: u32 = 0;
+    for (i < 256) {
+        t[i::usize] = i << 8;
+        i           = i + 1;
+    }
+    reset_table(?t[0], ?r[0]);
+    if (lookup_byte(?t[0], ?r[0], 0xFF, 5) != 5) { ret 1; }
+    ret 0;
+}

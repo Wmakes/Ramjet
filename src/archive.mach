@@ -120,6 +120,9 @@ pub rec Archive {
     # RAR 1.5-4.x archive
     rar4: bool;
 
+    # RAR 1.5-4.x file headers seen, for the RAR 1.5 solid rule
+    files4: usize;
+
     # RAR 1.5-4.x header encryption: keys for the last salt seen
     head4_valid: bool;
     head4_salt:  [8]u8;
@@ -470,6 +473,13 @@ fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
         val next:     u64 = data_pos + b.data_size;
 
         if (b.htype == H4.HEAD_MAIN) {
+            var ch:  H.FileHeader;
+            var off: usize = 0;
+            if (vi == 0 && H4.parse_old_comment(hp, ?b, ?ch, ?off)) {
+                val cpos:  u64 = (pos + off)::u64;
+                val csize: u64 = (b.total - off)::u64;
+                add_part(ar, vi, ?ch, true, false, false, true, cpos, csize, ?last_file);
+            }
             if (vi == 0) {
                 ar.solid    = (b.flags & H4.MHD_SOLID) != 0;
                 ar.volume   = (b.flags & H4.MHD_VOLUME) != 0;
@@ -484,6 +494,10 @@ fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
         or (b.htype == H4.HEAD_FILE || b.htype == H4.HEAD_NEWSUB) {
             var fh: H.FileHeader;
             if (!H4.parse_file(hp, ?b, ?fh)) { ret E.BAD_HEADER; }
+            # RAR 1.5 files carry no solid flag: every file after the first
+            # of a solid archive continues the stream
+            if (b.htype == H4.HEAD_FILE && fh.unp_ver < 20)                      { fh.solid = ar.solid && ar.files4 > 0; }
+            if (b.htype == H4.HEAD_FILE && (b.flags & H4.LHD_SPLIT_BEFORE) == 0) { ar.files4 = ar.files4 + 1; }
             # a Unix symbolic link is an entry whose data is the target
             val is_link: bool = b.htype == H4.HEAD_FILE && fh.host_os == H.HOST_UNIX && (fh.attr & 0xF000) == 0xA000;
             if (is_link) { fh.redir_type = H.REDIR_UNIX_SYMLINK; }
@@ -692,6 +706,7 @@ pub fun open(ar: *Archive, path: *u8, password: *u8) E.Code {
     ar.open_split          = -1;
     ar.rar4                = false;
     ar.head4_valid         = false;
+    ar.files4              = 0;
 
     var name: *u8   = M.dup(path, M.cstr_len(path));
     var vi:   usize = 0;

@@ -23,17 +23,19 @@ use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 
-use AR: ramjet.archive;
-use E:  ramjet.errors;
-use M:  ramjet.mem;
-use P:  ramjet.platform;
-use C4: ramjet.rar4.crypt;
-use U4: ramjet.rar4.unpack;
-use C:  ramjet.rar5.crypt;
-use H:  ramjet.rar5.header;
-use U:  ramjet.rar5.unpack;
-use S:  ramjet.stream;
-use TT: ramjet.tty;
+use AR:  ramjet.archive;
+use E:   ramjet.errors;
+use M:   ramjet.mem;
+use P:   ramjet.platform;
+use C4:  ramjet.rar4.crypt;
+use U4:  ramjet.rar4.unpack;
+use U15: ramjet.rar4.unpack15;
+use U20: ramjet.rar4.unpack20;
+use C:   ramjet.rar5.crypt;
+use H:   ramjet.rar5.header;
+use U:   ramjet.rar5.unpack;
+use S:   ramjet.stream;
+use TT:  ramjet.tty;
 
 pub val MODE_TEST:    u8 = 0;
 pub val MODE_EXTRACT: u8 = 1;
@@ -103,10 +105,12 @@ rec Deferred {
 }
 
 rec State {
-    ar:   *AR.Archive;
-    opt:  *Options;
-    unp:  U.Unpacker;
-    unp4: U4.Unpacker;
+    ar:    *AR.Archive;
+    opt:   *Options;
+    unp:   U.Unpacker;
+    unp4:  U4.Unpacker;
+    unp15: U15.Unpacker;
+    unp20: U20.Unpacker;
 
     # cached key for the last salt seen
     key_valid: bool;
@@ -328,10 +332,18 @@ fun path_exists(path: *u8) bool {
 
 # ---------------------------------------------------------------- keys
 
+# the pre-AES cipher an entry uses: 15, 20, or 0 for AES
+fun old_cipher(e: *AR.Entry) u32 {
+    if (e.h.unp_ver == 15) { ret 15; }
+    # RAR 2.x; a salt means the AES of RAR 2.9 and later
+    if ((e.h.unp_ver == 20 || e.h.unp_ver == 26) && !e.h.crypt.salted) { ret 20; }
+    ret 0;
+}
+
 fun entry_keys4(st: *State, e: *AR.Entry) E.Code {
     val ar: *AR.Archive = st.ar;
     if (ar.password == nil) { ret E.NEED_PASSWORD; }
-    if (e.h.unp_ver < 29)   { ret E.UNSUPPORTED; }
+    if (old_cipher(e) != 0) { ret E.OK; }
     var same: bool  = st.key4_valid;
     var i:    usize = 0;
     for (same && i < 8) {
@@ -377,7 +389,11 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
 
     var p: S.Packed;
     S.packed_open(?p, ar, e);
-    if (e.h.crypt.present && e.h.crypt.rar4) {
+    if (e.h.crypt.present && e.h.crypt.rar4 && old_cipher(e) != 0) {
+        if (ar.password == nil) { ret E.NEED_PASSWORD; }
+        S.packed_encrypt_old(?p, old_cipher(e), ar.password, ar.pw_len);
+    }
+    or (e.h.crypt.present && e.h.crypt.rar4) {
         val kc: E.Code = entry_keys4(st, e);
         if (kc != E.OK) { ret kc; }
         S.packed_encrypt128(?p, ?st.keys4.key[0], ?st.keys4.iv[0]);
@@ -407,10 +423,12 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
     }
     or {
         if (e.h.rar4) {
-            # RAR 3.x/4.x compression; the 1.5 and 2.x algorithms are not supported
-            if (e.h.unp_ver != 29 && e.h.unp_ver != 36) { ret E.UNSUPPORTED; }
+            # unpack versions: 15 (RAR 1.5), 20 and 26 (RAR 2.x), 29 and 36 (RAR 3.x-4.x)
             if (!(known && e.h.unp_size == 0 && AR.packed_size(ar, e) == 0)) {
-                rc = U4.run(?st.unp4, ?p, sink, e.h.unp_size, known, e.h.solid);
+                if (e.h.unp_ver == 29 || e.h.unp_ver == 36) { rc = U4.run(?st.unp4, ?p, sink, e.h.unp_size, known, e.h.solid); }
+                or (e.h.unp_ver == 20 || e.h.unp_ver == 26) { rc = U20.run(?st.unp20, ?p, sink, e.h.unp_size, known, e.h.solid); }
+                or (e.h.unp_ver == 15)                      { rc = U15.run(?st.unp15, ?p, sink, e.h.unp_size, known, e.h.solid); }
+                or                                          { ret E.UNSUPPORTED; }
             }
         }
         or (e.h.comp_version != 0 && !e.h.v1_as_v0) { ret E.UNSUPPORTED; }
@@ -892,6 +910,8 @@ pub fun load_comment(ar: *AR.Archive) {
             st.opt = ?opt;
             U.init(?st.unp);
             U4.init(?st.unp4);
+            U15.init(?st.unp15);
+            U20.init(?st.unp20);
             st.key_valid  = false;
             st.key4_valid = false;
             val n:   usize = e.h.unp_size::usize;
@@ -906,6 +926,8 @@ pub fun load_comment(ar: *AR.Archive) {
             e.h.solid = solid;
             U.dnit(?st.unp);
             U4.dnit(?st.unp4);
+            U15.dnit(?st.unp15);
+            U20.dnit(?st.unp20);
             if (rc == E.OK && !sink.failed) {
                 ar.comment     = buf;
                 ar.comment_len = sink.written::usize;
@@ -930,6 +952,8 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
     st.opt = opt;
     U.init(?st.unp);
     U4.init(?st.unp4);
+    U15.init(?st.unp15);
+    U20.init(?st.unp20);
     st.key_valid  = false;
     st.key4_valid = false;
     st.links      = V.init[Deferred](M.allocator());
@@ -956,6 +980,8 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
     finish_links(?st);
     U.dnit(?st.unp);
     U4.dnit(?st.unp4);
+    U15.dnit(?st.unp15);
+    U20.dnit(?st.unp20);
 
     val loud: bool = opt.quiet != QUIET_ALL;
     if (ar.bad_headers > 0) {

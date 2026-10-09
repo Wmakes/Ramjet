@@ -136,6 +136,44 @@ if [ -d "$samples/rar4" ]; then
     done
 fi
 
+# RAR 2.0 samples (tests/gen_samples_rar2.sh), compared with the 8.3-named
+# copies of the inputs that RAR 2.50 archived
+if [ -d "$samples/rar2" ] && [ -d "$root/rar2/dos/in" ]; then
+    r2="$samples/rar2"
+    din="$root/rar2/dos/in"
+    check2() {
+        local arc="$1"; shift
+        local out="$work/rar2_${arc%.rar}"
+        mkdir -p "$out"
+        if ! "$ramjet" x -o+ -pramjet "$r2/$arc" "$out/" >"$out.log" 2>&1; then
+            echo "FAIL rar2/$arc (ramjet exit status)"; grep -v ' OK$' "$out.log" | head -5 | sed 's/^/     /'
+            fail=$((fail + 1)); return
+        fi
+        local f bad=0
+        for f in "$@"; do
+            cmp -s "$din/$f" "$out/$f" || { echo "FAIL rar2/$arc: $f differs"; bad=1; }
+        done
+        if [ $bad = 0 ]; then echo "ok   rar2/$arc"; pass=$((pass + 1)); else fail=$((fail + 1)); fi
+    }
+    every=(HELLO.TXT TEXT.TXT CODE.EXE ZEROS.BIN RANDOM.BIN TONE.WAV EMPTY.TXT DIR/SUB/DEEP.TXT DIR/OTHER.TXT)
+    for a in allm0 allm1 allm2 allm3 allm4 allm5 solid solidm5 enc encsolid; do
+        check2 "$a.rar" "${every[@]}"
+    done
+    check2 mm.rar TONE.WAV
+    check2 mmf.rar TONE.WAV TEXT.TXT
+    check2 mmsolid.rar TONE.WAV TEXT.TXT CODE.EXE
+    check2 encstore.rar HELLO.TXT TEXT.TXT
+    check2 comment.rar HELLO.TXT TEXT.TXT
+    check2 single.rar HELLO.TXT
+    check2 vol.rar BIG.BIN
+    check2 volsolid.rar TEXT.TXT RANDOM.BIN
+    if "$ramjet" t -pwrong "$r2/enc.rar" >/dev/null 2>&1; then
+        echo "FAIL rar2: wrong password accepted"; fail=$((fail + 1))
+    else
+        echo "ok   rar2: wrong password refused"; pass=$((pass + 1))
+    fi
+fi
+
 # hostile archives: nothing may land outside the destination
 hostile="$work/hostile"
 python3 -I "$root/make_hostile.py" "$hostile"

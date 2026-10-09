@@ -104,6 +104,13 @@ pub fun parse_block(p: *u8, avail: usize, out: *Block) bool {
         out.data_size = B.read_u32(?c)::u64;
     }
     out.crc_ok = (crc32.hash(?p[2], out.total - 2) & 0xFFFF)::u16 == out.crc;
+    # a main header with an old-style comment: the CRC covers only its own
+    # fields (HEAD_TYPE to RESERVED2, plus the encryption version byte)
+    if (!out.crc_ok && out.htype == HEAD_MAIN && (out.flags & MHD_COMMENT) != 0) {
+        var n: usize = 11;
+        if ((out.flags & MHD_ENCRYPTVER) != 0) { n = 12; }
+        if (n + 2 <= out.total)                { out.crc_ok = (crc32.hash(?p[2], n) & 0xFFFF)::u16 == out.crc; }
+    }
     ret true;
 }
 
@@ -359,7 +366,8 @@ pub fun parse_file(p: *u8, b: *Block, out: *H.FileHeader) bool {
         out.crypt.salt[i] = 0;
         i                 = i + 1;
     }
-    if ((b.flags & LHD_SALT) != 0)                            { B.read_into(?c, ?out.crypt.salt[0], 8); }
+    out.crypt.salted = (b.flags & LHD_SALT) != 0;
+    if (out.crypt.salted)                                     { B.read_into(?c, ?out.crypt.salt[0], 8); }
     if ((b.flags & LHD_EXTTIME) != 0 && B.remaining(?c) >= 2) { read_exttime(?c, out, ftime); }
 
     out.has_blake2   = false;
@@ -431,4 +439,42 @@ test rar4_header__dos_time_fields {
     val got: H.Time = dos_time(t);
     if (got.sec != LT.local_to_utc(981173106)) { ret 1; }
     ret 0;
+}
+
+# the RAR 2.x style archive comment inside a main header: a 0x75 block with
+# the unpacked size (u16), unpack version, method and a 16-bit CRC, then the
+# compressed comment
+# ---
+# main:     the main header
+# b:        its parsed prefix
+# out:      a CMT service record for the comment
+# data_off: receives the comment data's offset from the main header start
+# ret:      false when there is no comment or it is malformed
+pub fun parse_old_comment(main: *u8, b: *Block, out: *H.FileHeader, data_off: *usize) bool {
+    if ((b.flags & MHD_COMMENT) == 0) { ret false; }
+    var at: usize = 13;
+    if ((b.flags & MHD_ENCRYPTVER) != 0) { at = 14; }
+    if (at + 13 > b.total)               { ret false; }
+    var c: B.Cursor = B.cursor(?main[at], b.total - at);
+    B.read_u16(?c);
+    val htype: u8 = B.read_u8(?c);
+    B.read_u16(?c);
+    val size: usize = B.read_u16(?c)::usize;
+    val unp:  u16   = B.read_u16(?c);
+    val ver:  u8    = B.read_u8(?c);
+    val meth: u8    = B.read_u8(?c);
+    B.read_u16(?c);
+    if (c.bad || htype != HEAD_COMMENT || size < 13 || at + size > b.total) { ret false; }
+
+    M.zero_bytes(out::*u8, $size_of(H.FileHeader));
+    out.rar4     = true;
+    out.unp_ver  = ver;
+    out.unp_size = unp::u64;
+    out.method   = 0;
+    if (meth >= 0x30 && meth <= 0x35) { out.method = (meth - 0x30)::u64; }
+    out.dict_size = 0x10000;
+    out.name      = M.dup("CMT"::*u8, 3);
+    out.name_len  = 3;
+    @data_off     = at + 13;
+    ret true;
 }

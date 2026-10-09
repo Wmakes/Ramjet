@@ -4,6 +4,17 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## Unreleased
+
+Older archives.
+
+- RAR 2.0 archives (unpack versions 20 and 26): every method, solid
+  archives, multimedia audio compression, the RAR 2.0 cipher, old-style
+  archive comments. Checked against archives made by RAR 2.50.
+- RAR 1.5 archives (unpack version 15) and the RAR 1.5 cipher: implemented,
+  but untested against real archives.
+- Fix: a main header with an old-style comment was reported as damaged.
+
 ## 0.2.0 — 2026-10-09
 
 Command line.

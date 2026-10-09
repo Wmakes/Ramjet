@@ -12,6 +12,8 @@ disassembly), and nothing is copied or translated from other implementations.
 | `technote.txt` from the RAR 4.20 package (`tests/get_rar4.sh` downloads it; **not** in the repo, the RAR license forbids distributing parts of the package) | RAR EULA | the RAR 1.5-4.x container: block layout, main and file headers |
 | `rar` 7.23 and `rar` 4.20 (trial), run as ordinary programs | RAR EULA | create the sample archives in `tests/samples` and `tests/samples/rar4`; `rar lt` output is the expected listing |
 | libarchive `archive_read_support_format_rar5.c` and `archive_read_support_format_rar.c` | BSD-2-Clause, (c) Grzegorz Antoniak, Tim Kientzle, Andres Mejia | **read only**, to understand the compressed bitstreams and the standard VM filters; no code copied or translated |
+| The Unarchiver's XADMaster `XADRAR15Handle.m`, `XADRAR20Handle.m`, `RARAudioDecoder.c`, `XADRAR15CryptHandle.m`, `XADRAR20CryptHandle.m`, `XADRARParser.m` | LGPL-2.1, (c) MacPaw; no mention of UnRAR, RARLAB or Roshal in any of them | **read only**, for the RAR 1.5 and 2.0 algorithms, their ciphers and old-style comments; no code copied or translated |
+| `rar` 2.50 for DOS (`rar250.exe` from rarlab.com, git-ignored in `tests/rar2/`), run in DOSBox | RAR 2.50 license | creates the RAR 2.0 sample archives in `tests/samples/rar2` |
 | PPMd var.H (Dmitry Shkarin, 2001) and Igor Pavlov's Ppmd7 | public domain | the PPMd model used by RAR 2.9 text compression |
 | FIPS-180-4, FIPS-197, RFC 2104, RFC 4231, RFC 7693, RFC 8018, RFC 8536 | public standards | SHA-1, AES-128/256, HMAC-SHA256, BLAKE2s, PBKDF2, TZif |
 | BLAKE2 paper / blake2.net | public; reference code CC0 | BLAKE2sp tree parameters |
@@ -77,16 +79,34 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
   salt followed by the header in AES-128-CBC, padded to 16 bytes
   (`all_hdr_encrypted`, `volumes_enc`).
 
+## RAR 2.0: confirmed black-box against `rar` 2.50 output
+
+- **Decoder** (`src/rar4/unpack20.mach`): every method `-m0` to `-m5`,
+  solid archives, multimedia audio blocks (`-mm`, `-mmf`, solid), `.rar` /
+  `.r00` volumes (`tests/samples/rar2`).
+- **Cipher** (`src/rar4/crypt_old.mach`): the RAR 2.0 block cipher decrypts
+  compressed, solid and stored files correctly; a wrong password fails the
+  CRC (`enc`, `encsolid`, `encstore`).
+- **Old-style comments**: a 0x75 block inside the main header, compressed
+  like a file; the main header's CRC then covers only its own fields, not
+  the comment (`comment`).
+
 ## Implemented from the format description but not confirmed
+
+- **RAR 1.5 decoder and cipher** (`src/rar4/unpack15.mach`): no RAR 1.5x
+  binary is available any more to make samples. The fixed code tables are
+  checked to be complete prefix codes, and fuzzing (RAR 2.0 data relabeled
+  as version 15) shows it rejects bad data without crashing, but it has
+  never decoded a real RAR 1.5 file.
+- **RAR 2.6 encryption** (unpack version 26): treated as the RAR 2.0 cipher
+  when no salt is present; no sample exists.
+- **RAR 1.3 cipher and the pre-1.5 `RE~^` container**: not supported.
 
 - **RAR 5 ARM filter** (type 3): `rar` 7.23 never emitted it, even for real
   ARMv7 binaries, so no sample exercises it.
 - **RAR 5 compression algorithm version 1** (RAR 7 dictionaries over 4 GB):
   not decoded; such files report "unsupported feature". `-md1g` still
   produces version 0 data.
-- **RAR 1.5 and 2.x compression** (unpack versions 15, 20, 26): not
-  supported. No available tool writes these formats, so there is nothing to
-  test against. Stored files in such archives extract normally.
 - **RAR 4 passwords of 28+ characters**: hashed as described; some old RAR
   versions are said to differ there, untested.
 - **Windows-only metadata** (NTFS ACL and stream service headers): parsed

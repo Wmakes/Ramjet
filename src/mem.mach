@@ -57,6 +57,11 @@ pub fun free(p: *u8, n: usize) {
     A.deallocate_raw(?g_alloc, p::ptr, size, 16);
 }
 
+# set n bytes to zero
+pub fun zero_bytes(p: *u8, n: usize) {
+    if (n > 0) { memory.raw_zero(p::ptr, n); }
+}
+
 # copy n bytes between non-overlapping ranges
 pub fun copy(dst: *u8, src: *u8, n: usize) {
     if (n > 0) { memory.raw_copy(dst::ptr, src::ptr, n); }

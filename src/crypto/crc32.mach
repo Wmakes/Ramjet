@@ -37,6 +37,12 @@ fun build() {
     ready = true;
 }
 
+# one entry of the byte-wise CRC table (older RAR ciphers are built on it)
+pub fun table_entry(i: u32) u32 {
+    if (!ready) { build(); }
+    ret table[(i & 0xFF)::usize];
+}
+
 pub fun init() u32 {
     if (!ready) { build(); }
     ret 0xFFFFFFFF;

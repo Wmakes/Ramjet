@@ -14,7 +14,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent
 ITER = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 RAMJET = sys.argv[2] if len(sys.argv) > 2 else str(ROOT.parent / "out/linux-x86_64/release/bin/ramjet")
-SEEDS = [p for p in sorted((ROOT / "samples").glob("*.rar")) + sorted((ROOT / "samples" / "rar4").glob("*.rar"))
+SEEDS = [p for p in sorted((ROOT / "samples").glob("*.rar")) + sorted((ROOT / "samples" / "rar4").glob("*.rar")) + sorted((ROOT / "samples" / "rar2").glob("*.rar"))
          if ".part" not in p.name and os.path.getsize(p) < 400000]
 
 

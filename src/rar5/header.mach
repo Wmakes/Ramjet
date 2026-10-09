@@ -180,7 +180,9 @@ pub fun parse_main(b: *Block, out: *MainHeader) bool {
 # AES-256 parameters from an archive encryption header or a file encryption
 # record
 # ---
-# rar4:      RAR 2.9-4.x AES-128 with an 8-byte salt (salt[0..8])
+# rar4:      RAR 1.5-4.x encryption; AES-128 with an 8-byte salt (salt[0..8])
+#            when salted, otherwise the RAR 1.5 or 2.0 cipher
+# salted:    a RAR 1.5-4.x header carried a salt
 # version:   encryption algorithm version, 0 for AES-256
 # flags:     0x1 password check present, 0x2 tweaked checksums
 # kdf_count: binary logarithm of the PBKDF2 iteration count
@@ -190,6 +192,7 @@ pub fun parse_main(b: *Block, out: *MainHeader) bool {
 pub rec Crypt {
     present:   bool;
     rar4:      bool;
+    salted:    bool;
     version:   u64;
     flags:     u64;
     kdf_count: u8;

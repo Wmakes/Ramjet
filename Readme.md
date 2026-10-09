@@ -47,20 +47,21 @@ Ramjet is an independent implementation.
 
 Ramjet is being built reader first; the writer comes after the reader is complete.
 
-Reading works for **RAR 5.0** and **RAR 2.9–4.x** archives (what RAR 3.x, 4.x, 5.x, 6.x and 7.x create):
+Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what RAR 2.x through 7.x create):
 
 * listing (`l`, `lt`), testing (`t`), extraction (`x`, `e`) and printing (`p`)
 * every compression method, solid archives, dictionaries up to 4 GB (RAR 5) and 4 MB (RAR 4)
 * RAR 5 filters (delta, x86 E8/E8E9; ARM implemented but untested) and RAR 4 filters (delta, x86, Itanium, RGB, audio)
-* RAR 4 PPMd text compression
+* RAR 4 PPMd text compression, RAR 2.0 multimedia (audio) compression
+* RAR 1.5 compression is implemented but untested (no RAR 1.5 archives to test with)
 * multi-volume archives (`.partN.rar` and `.rar`/`.r00` naming), including split solid and encrypted sets
-* encryption: AES-256 (RAR 5) and AES-128 (RAR 4), of file data and of headers
+* encryption: AES-256 (RAR 5) and AES-128 (RAR 4), of file data and of headers, and the RAR 2.0 cipher
 * CRC32 and BLAKE2sp checksums, including per-volume checksums of split files
 * symbolic links, hard links, file references (`-oi`), file versions (`-ver`), SFX archives, archive comments
 * file times and Unix permissions (Linux) or attributes (Windows) are restored; set-id bits never are
 * builds for Linux, Windows and macOS (Windows tested under Wine)
 
-Not yet: the RAR 1.5 and 2.x compression algorithms, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
+Not yet: verified RAR 1.5 support, archives older than RAR 1.5, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
 
 See [`docs/clean-room-notes.md`](docs/clean-room-notes.md) for where every piece of format knowledge came from.
 
@@ -109,6 +110,7 @@ mach test .                          unit tests
 tests/gen_samples.sh                 rebuild the RAR 5 samples (needs the rar tool)
 tests/get_rar4.sh                    download RAR 4.20 (git-ignored) for the RAR 4 samples
 tests/gen_samples_rar4.sh            rebuild the RAR 4 samples
+tests/gen_samples_rar2.sh            rebuild the RAR 2.0 samples (needs rar250.exe and dosbox)
 tests/check_extract.sh               extract every sample and compare with its source files
 tests/check_cli.sh                   command-line behavior and exit codes
 tests/compare_list.py [bin] [dir]    compare `ramjet lt` with `rar lt` (dir: tests/samples/rar4 for RAR 4)

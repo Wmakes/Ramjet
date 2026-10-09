@@ -21,6 +21,7 @@ use ramjet.crypto.aes;
 use b2: ramjet.crypto.blake2;
 use E:  ramjet.errors;
 use M:  ramjet.mem;
+use OC: ramjet.rar4.crypt_old;
 
 pub rec Packed {
     ar:       *AR.Archive;
@@ -32,6 +33,10 @@ pub rec Packed {
     part_bad: bool;
 
     encrypted: bool;
+    # RAR 1.5 / 2.0 ciphers instead of AES (old = 15 or 20)
+    old:       u32;
+    c15:       OC.Rar15;
+    c20:       OC.Rar20;
     key:       aes.Key;
     iv:        [16]u8;
     block:     [16]u8;
@@ -48,6 +53,7 @@ pub fun packed_open(p: *Packed, ar: *AR.Archive, e: *AR.Entry) {
     b2.sp_init(?p.part_b2);
     p.part_bad  = false;
     p.encrypted = false;
+    p.old       = 0;
     p.block_pos = 0;
     p.block_len = 0;
 }
@@ -56,6 +62,14 @@ pub fun packed_encrypt(p: *Packed, key: *u8, iv: *u8) {
     p.encrypted = true;
     aes.init(?p.key, key);
     M.copy(?p.iv[0], iv, 16);
+}
+
+# data of RAR 1.5 (version 15) or RAR 2.0 (version 20) archives
+pub fun packed_encrypt_old(p: *Packed, version: u32, pw: *u8, n: usize) {
+    p.encrypted = true;
+    p.old       = version;
+    if (version == 15) { OC.rar15_init(?p.c15, pw, n); }
+    or                 { OC.rar20_init(?p.c20, pw, n); }
 }
 
 # AES-128 data of RAR 2.9-4.x archives
@@ -114,12 +128,22 @@ fun raw_read(p: *Packed, dst: *u8, n: usize) usize {
 # read up to n bytes of (decrypted) packed data; fewer means the data ended
 pub fun packed_read(p: *Packed, dst: *u8, n: usize) usize {
     if (!p.encrypted) { ret raw_read(p, dst, n); }
+    if (p.old == 15) {
+        val got: usize = raw_read(p, dst, n);
+        var i:   usize = 0;
+        for (i < got) {
+            dst[i] = OC.rar15_byte(?p.c15, dst[i]);
+            i      = i + 1;
+        }
+        ret got;
+    }
     var done: usize = 0;
     for (done < n) {
         if (p.block_pos == p.block_len) {
             val got: usize = raw_read(p, ?p.block[0], 16);
-            if (got != 16) { ret done; }
-            aes.cbc_decrypt(?p.key, ?p.iv[0], ?p.block[0], 16);
+            if (got != 16)   { ret done; }
+            if (p.old == 20) { OC.rar20_block(?p.c20, ?p.block[0]); }
+            or               { aes.cbc_decrypt(?p.key, ?p.iv[0], ?p.block[0], 16); }
             p.block_pos = 0;
             p.block_len = 16;
         }
