@@ -4,6 +4,14 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## Unreleased
+
+- Fix: RAR 3.x and 4.x archives with passwords of 29 or more characters
+  did not decrypt. RAR hashes the password with a SHA-1 quirk that
+  overwrites the password buffer once it passes 64 bytes; checked against
+  archives made by RAR 3.00, 3.41, 3.50 and 4.20. (This is what the 0.3.0
+  note about "RAR 3.0-3.4 encryption" actually was.)
+
 ## 0.3.1 — 2026-10-09
 
 Speed.

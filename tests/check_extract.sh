@@ -174,6 +174,23 @@ if [ -d "$samples/rar2" ] && [ -d "$root/rar2/dos/in" ]; then
     fi
 fi
 
+# RAR 3.x encryption (tests/gen_samples_rar3.sh): short and long passwords;
+# 29+ character passwords need RAR's SHA-1 quirk
+if [ -d "$samples/rar3" ]; then
+    long="ramjet-a-much-longer-password-for-the-bug"
+    for f in "$samples"/rar3/*.rar; do
+        pw=ramjet
+        case "$f" in *long*) pw="$long" ;; esac
+        out="$work/rar3_$(basename "$f" .rar)"
+        mkdir -p "$out"
+        if "$ramjet" x -o+ -p"$pw" "$f" "$out/" >/dev/null 2>&1 && cmp -s "$input/text.txt" "$out/text.txt" && cmp -s "$input/hello.txt" "$out/hello.txt"; then
+            echo "ok   rar3/$(basename "$f")"; pass=$((pass + 1))
+        else
+            echo "FAIL rar3/$(basename "$f")"; fail=$((fail + 1))
+        fi
+    done
+fi
+
 # hostile archives: nothing may land outside the destination
 hostile="$work/hostile"
 python3 -I "$root/make_hostile.py" "$hostile"

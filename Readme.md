@@ -61,8 +61,6 @@ Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what 
 * file times and Unix permissions (Linux) or attributes (Windows) are restored; set-id bits never are
 * builds for Linux, Windows and macOS (Windows tested under Wine)
 
-Known limitation: encrypted archives made by RAR 3.0–3.4 may not decrypt (RAR 3.5 and later are fine).
-
 Not yet: verified RAR 1.5 support, archives older than RAR 1.5, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
 
 See [`docs/clean-room-notes.md`](docs/clean-room-notes.md) for where every piece of format knowledge came from.
@@ -115,6 +113,7 @@ tests/gen_samples.sh                 rebuild the RAR 5 samples (needs the rar to
 tests/get_rar4.sh                    download RAR 4.20 (git-ignored) for the RAR 4 samples
 tests/gen_samples_rar4.sh            rebuild the RAR 4 samples
 tests/gen_samples_rar2.sh            rebuild the RAR 2.0 samples (needs rar250.exe and dosbox)
+tests/gen_samples_rar3.sh            rebuild the RAR 3.x encryption samples (downloads pinned RAR 3.x packages)
 tests/check_extract.sh               extract every sample and compare with its source files
 tests/check_cli.sh                   command-line behavior and exit codes
 tests/compare_list.py [bin] [dir]    compare `ramjet lt` with `rar lt` (dir: tests/samples/rar4 for RAR 4)

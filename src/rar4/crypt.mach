@@ -11,8 +11,10 @@
 #   key    = first 16 bytes of the final digest, byte order reversed within
 #            each 32-bit word
 #
-# passwords whose UTF-16 form plus salt reaches 64 bytes are hashed as
-# written here; some old RAR versions differ for those, which is untested.
+# RAR hashes with a quirk (see SHA.update_rar): an update that covers whole
+# 64-byte blocks of the password buffer overwrites them, so passwords whose
+# UTF-16 form plus salt passes 64 bytes (29+ characters) are hashed over the
+# changing buffer. confirmed for RAR 3.0, 3.41, 3.50 and 4.20 archives.
 
 use std.types.size.usize;
 
@@ -85,11 +87,11 @@ pub fun derive(password: *u8, pw_len: usize, salt: *u8, out: *Keys) {
     var ctr: [3]u8;
     var r:   u32 = 0;
     for (r < ROUNDS) {
-        SHA.update(?s, ?raw[0], n);
+        SHA.update_rar(?s, ?raw[0], n);
         ctr[0] = (r & 0xFF)::u8;
         ctr[1] = ((r >> 8) & 0xFF)::u8;
         ctr[2] = ((r >> 16) & 0xFF)::u8;
-        SHA.update(?s, ?ctr[0], 3);
+        SHA.update_rar(?s, ?ctr[0], 3);
         if (r % (ROUNDS / 16) == 0) {
             var snap: SHA.Sha1 = s;
             var d:    [20]u8;

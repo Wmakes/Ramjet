@@ -14,6 +14,8 @@ disassembly), and nothing is copied or translated from other implementations.
 | libarchive `archive_read_support_format_rar5.c` and `archive_read_support_format_rar.c` | BSD-2-Clause, (c) Grzegorz Antoniak, Tim Kientzle, Andres Mejia | **read only**, to understand the compressed bitstreams and the standard VM filters; no code copied or translated |
 | The Unarchiver's XADMaster `XADRAR15Handle.m`, `XADRAR20Handle.m`, `RARAudioDecoder.c`, `XADRAR15CryptHandle.m`, `XADRAR20CryptHandle.m`, `XADRARParser.m` | LGPL-2.1, (c) MacPaw; no mention of UnRAR, RARLAB or Roshal in any of them | **read only**, for the RAR 1.5 and 2.0 algorithms, their ciphers and old-style comments; no code copied or translated |
 | `rar` 2.50 for DOS (`rar250.exe` from rarlab.com, git-ignored in `tests/rar2/`), run in DOSBox | RAR 2.50 license | creates the RAR 2.0 sample archives in `tests/samples/rar2` |
+| XADMaster `RARBug.c`, `XADRARAESHandle.m` | LGPL-2.1, (c) MacPaw | **read only**, for RAR's SHA-1 quirk in password hashing |
+| `rar` 3.00, 3.41, 3.50 for Linux from the [dryes/rarlinux](https://github.com/dryes/rarlinux) mirror of unmodified trial packages, pinned by SHA-256 in `tests/gen_samples_rar3.sh` (git-ignored; documentation files match RARLAB's packages byte for byte), run without network | RAR licenses | create the RAR 3.x encryption samples |
 | PPMd var.H (Dmitry Shkarin, 2001) and Igor Pavlov's Ppmd7 | public domain | the PPMd model used by RAR 2.9 text compression |
 | FIPS-180-4, FIPS-197, RFC 2104, RFC 4231, RFC 7693, RFC 8018, RFC 8536 | public standards | SHA-1, AES-128/256, HMAC-SHA256, BLAKE2s, PBKDF2, TZif |
 | BLAKE2 paper / blake2.net | public; reference code CC0 | BLAKE2sp tree parameters |
@@ -75,6 +77,12 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
   UTF-16LE password + salt + 3-byte round counter; IV bytes from byte 19 of
   the running digest every 2^14 rounds; key = the final digest's first 16
   bytes, byte-reversed per 32-bit word (`all_encrypted`, `all_solid_enc`).
+- **Long passwords**: RAR's SHA-1 overwrites each whole 64-byte block of
+  the password buffer it hashes in one update with the block's last 16
+  message-schedule words (little endian), and the next of the 2^18 rounds
+  hashes the changed buffer. Only passwords whose UTF-16 form plus salt
+  passes 64 bytes (29+ characters) are affected. Confirmed with RAR 3.00,
+  3.41, 3.50 and 4.20 archives at lengths 28-126 (`tests/samples/rar3`).
 - **Header encryption**: every block after the main header is 8 bytes of
   salt followed by the header in AES-128-CBC, padded to 16 bytes
   (`all_hdr_encrypted`, `volumes_enc`).
@@ -107,7 +115,5 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
 - **RAR 5 compression algorithm version 1** (RAR 7 dictionaries over 4 GB):
   not decoded; such files report "unsupported feature". `-md1g` still
   produces version 0 data.
-- **RAR 4 passwords of 28+ characters**: hashed as described; some old RAR
-  versions are said to differ there, untested.
 - **Windows-only metadata** (NTFS ACL and stream service headers): parsed
   and skipped.
