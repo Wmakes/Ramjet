@@ -2,7 +2,7 @@
 """Build hostile RAR5 archives (stored data only) for the extraction safety tests.
 
 The rar tool refuses to create these, so they are assembled here from the
-container layout in docs/rar5-technote.html: signature, main header, file
+container layout in the RAR 5.0 technote (https://www.rarlab.com/technote.htm): signature, main header, file
 headers with optional redirection records, end header.
 
 usage: tests/make_hostile.py <output-dir>

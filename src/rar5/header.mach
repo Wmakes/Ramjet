@@ -1,6 +1,6 @@
 # RAR 5.0 block headers
 #
-# layout follows the RARLAB technote (docs/rar5-technote.html). every parser
+# layout follows the RARLAB technote (https://www.rarlab.com/technote.htm). every parser
 # here works on a plaintext copy of one header: the archive layer locates the
 # header, decrypts it when headers are encrypted, and hands the bytes over.
 

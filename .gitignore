@@ -2,3 +2,4 @@ out/
 tests/fuzz_crash_*.rar
 tests/rar4/
 tests/rar2/
+tests/samples/

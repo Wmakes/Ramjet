@@ -107,6 +107,8 @@ Extraction never writes outside the destination: names with `..` are refused, ab
 
 ## Testing
 
+The sample archives are not part of the repository: they are made on your machine by the archivers themselves (RAR 7.x, RAR 4.20 and RAR 2.50, run as ordinary programs), so first run the generators below.
+
 ```
 mach test .                          unit tests
 tests/gen_samples.sh                 rebuild the RAR 5 samples (needs the rar tool)

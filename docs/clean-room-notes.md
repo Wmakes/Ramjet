@@ -8,9 +8,9 @@ disassembly), and nothing is copied or translated from other implementations.
 
 | Source | License | How it is used |
 |---|---|---|
-| [RARLAB RAR 5.0 technote](https://www.rarlab.com/technote.htm), copy in `docs/rar5-technote.html` | no license stated; read for interoperability | the RAR5 container: signature, every header and extra record |
+| [RARLAB RAR 5.0 technote](https://www.rarlab.com/technote.htm) (linked, not copied into the repo) | no license stated; read for interoperability | the RAR5 container: signature, every header and extra record |
 | `technote.txt` from the RAR 4.20 package (`tests/get_rar4.sh` downloads it; **not** in the repo, the RAR license forbids distributing parts of the package) | RAR EULA | the RAR 1.5-4.x container: block layout, main and file headers |
-| `rar` 7.23 and `rar` 4.20 (trial), run as ordinary programs | RAR EULA | create the sample archives in `tests/samples` and `tests/samples/rar4`; `rar lt` output is the expected listing |
+| `rar` 7.23 and `rar` 4.20 (trial), run as ordinary programs | RAR EULA | create the sample archives in `tests/samples` and `tests/samples/rar4` on the developer's machine (generated, not committed); `rar lt` output is the expected listing |
 | libarchive `archive_read_support_format_rar5.c` and `archive_read_support_format_rar.c` | BSD-2-Clause, (c) Grzegorz Antoniak, Tim Kientzle, Andres Mejia | **read only**, to understand the compressed bitstreams and the standard VM filters; no code copied or translated |
 | The Unarchiver's XADMaster `XADRAR15Handle.m`, `XADRAR20Handle.m`, `RARAudioDecoder.c`, `XADRAR15CryptHandle.m`, `XADRAR20CryptHandle.m`, `XADRARParser.m` | LGPL-2.1, (c) MacPaw; no mention of UnRAR, RARLAB or Roshal in any of them | **read only**, for the RAR 1.5 and 2.0 algorithms, their ciphers and old-style comments; no code copied or translated |
 | `rar` 2.50 for DOS (`rar250.exe` from rarlab.com, git-ignored in `tests/rar2/`), run in DOSBox | RAR 2.50 license | creates the RAR 2.0 sample archives in `tests/samples/rar2` |
