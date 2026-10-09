@@ -28,6 +28,8 @@ pub val UNSAFE_PATH:    Code = 17;
 pub val DICT_TOO_LARGE: Code = 18;
 pub val SOLID_BROKEN:   Code = 19;
 pub val USAGE:          Code = 20;
+pub val NO_FILES:       Code = 21;
+pub val USER_BREAK:     Code = 22;
 
 pub fun message(c: Code) str {
     if (c == OK)             { ret "ok"; }
@@ -51,5 +53,29 @@ pub fun message(c: Code) str {
     if (c == DICT_TOO_LARGE) { ret "dictionary size is too large"; }
     if (c == SOLID_BROKEN)   { ret "previous solid file failed, cannot continue"; }
     if (c == USAGE)          { ret "bad command line"; }
+    if (c == NO_FILES)       { ret "no files to process"; }
+    if (c == USER_BREAK)     { ret "stopped by the user"; }
     ret "unknown error";
+}
+
+# process exit status for an error, following the numbers unrar uses so
+# scripts can tell kinds of failure apart:
+#   0 success, 1 warning, 2 fatal error, 3 corrupt data or checksum, 5 write
+#   error, 6 open error, 7 command line error, 8 out of memory, 9 cannot
+#   create a file, 10 no files matched, 11 wrong password, 255 stopped
+pub fun exit_code(c: Code) i64 {
+    if (c == OK)                                  { ret 0; }
+    if (c == UNSUPPORTED)                         { ret 1; }
+    if (c == DATA_CRC || c == BAD_DATA)           { ret 3; }
+    if (c == HEADER_CRC || c == TRUNCATED)        { ret 3; }
+    if (c == MISSING_VOLUME || c == SOLID_BROKEN) { ret 3; }
+    if (c == WRITE)                               { ret 5; }
+    if (c == OPEN || c == READ)                   { ret 6; }
+    if (c == USAGE)                               { ret 7; }
+    if (c == NO_MEMORY || c == DICT_TOO_LARGE)    { ret 8; }
+    if (c == CREATE || c == UNSAFE_PATH)          { ret 9; }
+    if (c == NO_FILES)                            { ret 10; }
+    if (c == NEED_PASSWORD || c == BAD_PASSWORD)  { ret 11; }
+    if (c == USER_BREAK)                          { ret 255; }
+    ret 2;
 }

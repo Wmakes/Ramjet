@@ -77,15 +77,28 @@ mach build . -p release      # release: out/linux-x86_64/release/bin/ramjet
 ## Usage
 
 ```
-ramjet l  archive.rar                list contents
-ramjet lt archive.rar                list with technical details
-ramjet t  archive.rar                test integrity
-ramjet x  archive.rar [dest/]        extract with paths
-ramjet e  archive.rar [dest/]        extract without paths
-ramjet p  archive.rar [name]         print a file to stdout
+ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]
 
-switches: -p<password>   -o+ overwrite   -o- skip existing   -ver extract older versions
+commands:
+  l   list           lt  list with technical details     lb  bare names
+  t   test           x   extract with paths               e   extract without paths
+  p   print a file to stdout
+
+switches:
+  -p<password>   set the password (-p asks, -p- never asks)
+  -o+ / -o- / -or   overwrite / skip / rename existing files   (-y = yes to all)
+  -x<mask>       exclude files (repeatable, -x@<file> for a list)
+  -op<path>      extract into this directory      -ad  into a folder named after the archive
+  -kb            keep files that failed their checksum
+  -ver           also extract older file versions as name;N
+  -idq / -inul   quiet / silent                    -idp  no progress display
 ```
+
+Switches can go anywhere on the line (until `--`). A last argument ending in `/` is the destination; other arguments select files by name or `*`/`?` mask, and a directory name selects everything under it.
+
+On a terminal Ramjet asks for missing passwords (input is not echoed) and asks before overwriting files; without one it never waits for input and keeps existing files. Large files show a progress percentage.
+
+Exit status: 0 ok, 1 warning, 2 fatal error, 3 damaged data, 5 write error, 6 open error, 7 bad command line, 8 out of memory, 9 cannot create a file, 10 no files matched, 11 wrong or missing password, 255 stopped.
 
 Extraction never writes outside the destination: names with `..` are refused, absolute names are made relative, symbolic links are created only after all files are written, and on Windows backslashes, drive letters, trailing dots and device names (`CON`, `NUL`, ...) are neutralized too.
 
@@ -97,6 +110,7 @@ tests/gen_samples.sh                 rebuild the RAR 5 samples (needs the rar to
 tests/get_rar4.sh                    download RAR 4.20 (git-ignored) for the RAR 4 samples
 tests/gen_samples_rar4.sh            rebuild the RAR 4 samples
 tests/check_extract.sh               extract every sample and compare with its source files
+tests/check_cli.sh                   command-line behavior and exit codes
 tests/compare_list.py [bin] [dir]    compare `ramjet lt` with `rar lt` (dir: tests/samples/rar4 for RAR 4)
 tests/fuzz.py 1000                   corrupted archives must never crash ramjet
 ```

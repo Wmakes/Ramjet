@@ -7,6 +7,7 @@ use std.types.string.str;
 
 use AR: ramjet.archive;
 use E:  ramjet.errors;
+use LT: ramjet.localtime;
 use M:  ramjet.mem;
 use H:  ramjet.rar5.header;
 use T:  ramjet.timefmt;
@@ -66,7 +67,8 @@ fun print_date(t: H.Time) {
         print.print("                   ");
         ret;
     }
-    val c: T.Civil = T.civil(t.sec);
+    # shown in local time, as the archiver showed it
+    val c: T.Civil = T.civil(t.sec + LT.offset_at(t.sec));
     print.printf("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", c.year, c.month, c.day, c.hour, c.minute, c.second);
 }
 
@@ -133,20 +135,32 @@ fun print_damage(ar: *AR.Archive) i64 {
     var status: i64 = 0;
     if (ar.bad_headers > 0) {
         print.eprintf("ramjet: {} header(s) with bad checksum\n", ar.bad_headers);
-        status = 1;
+        status = E.exit_code(E.HEADER_CRC);
     }
     if (ar.truncated) {
         print.eprintln("ramjet: archive is truncated");
-        status = 1;
+        status = E.exit_code(E.TRUNCATED);
     }
     if (ar.missing_volume) {
         print.eprintln("ramjet: a following volume is missing");
-        status = 1;
+        status = E.exit_code(E.MISSING_VOLUME);
     }
     ret status;
 }
 
-pub fun list(ar: *AR.Archive, archive: *u8, technical: bool) i64 {
+# one name per line, files and directories, nothing else
+fun list_bare(ar: *AR.Archive) i64 {
+    var i: usize = 0;
+    for (i < ar.entries.len) {
+        val e: *AR.Entry = AR.entry(ar, i);
+        if (!e.service) { print.println(e.name::str); }
+        i = i + 1;
+    }
+    ret print_damage(ar);
+}
+
+pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool) i64 {
+    if (bare) { ret list_bare(ar); }
     print_header(ar, archive);
     var attr:         [11]u8;
     var total_unp:    u64 = 0;

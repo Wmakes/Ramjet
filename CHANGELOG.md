@@ -1,0 +1,41 @@
+# Changelog
+
+Versions follow [semantic versioning](https://semver.org). The version in
+`mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
+also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
+
+## 0.2.0 — 2026-10-09
+
+Command line.
+
+- Asks for a missing or wrong password on the terminal, without echo (`-p`
+  asks up front, `-p-` never asks); up to three tries.
+- Asks before overwriting: yes, no, all, never, rename, quit. `-o+`, `-o-`,
+  `-or` (rename to `name (1).ext`) and `-y` decide up front. Without a
+  terminal nothing waits for input and existing files are kept.
+- Progress percentage for files over 4 MB on a terminal (`-idp` turns it off).
+- Exit status by kind of failure: 3 damaged data, 6 open error, 7 bad command
+  line, 10 no files matched, 11 password, and more (see `--help`).
+- `-x<mask>` and `-x@<file>` excludes, `@<file>` name lists, `-op<path>`,
+  `-ad`, `-kb`, `-idq`, `-inul`, `lb` bare listing, `--help`, `--version`.
+- A summary line after testing or extracting; listings show local time.
+
+Fixes:
+
+- A single name after the archive selected nothing and became the
+  destination; only an argument ending in `/` is a destination now.
+- Skipping an existing file in a solid archive broke every later file; the
+  skipped file is still decoded, into nothing.
+
+## 0.1.0 — 2026-10-09
+
+First release: a clean-room RAR reader.
+
+- RAR 5.0: every compression method, solid archives, delta and x86 filters,
+  multi-volume sets, AES-256 for data and headers, CRC32 and BLAKE2sp.
+- RAR 2.9–4.x: LZ, PPMd, the standard VM filters (x86, Itanium, delta, RGB,
+  audio), solid archives, old and new volume naming, AES-128 for data and
+  headers.
+- Symbolic and hard links, file references, file versions, SFX archives,
+  comments; times and permissions restored; extraction confined to the
+  destination directory.

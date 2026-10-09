@@ -33,23 +33,66 @@ use C:  ramjet.rar5.crypt;
 use H:  ramjet.rar5.header;
 use U:  ramjet.rar5.unpack;
 use S:  ramjet.stream;
+use TT: ramjet.tty;
 
 pub val MODE_TEST:    u8 = 0;
 pub val MODE_EXTRACT: u8 = 1;
 pub val MODE_FLAT:    u8 = 2;
 pub val MODE_PRINT:   u8 = 3;
 
-pub val OVERWRITE_SKIP: u8 = 0;
-pub val OVERWRITE_ALL:  u8 = 1;
+pub val OVERWRITE_SKIP:   u8 = 0;
+pub val OVERWRITE_ALL:    u8 = 1;
+pub val OVERWRITE_ASK:    u8 = 2;
+pub val OVERWRITE_RENAME: u8 = 3;
 
+pub val QUIET_NONE:  u8 = 0;
+pub val QUIET_FILES: u8 = 1;
+pub val QUIET_ALL:   u8 = 2;
+
+# what to do and how to talk about it
+# ---
+# mode:        MODE_TEST, MODE_EXTRACT, MODE_FLAT or MODE_PRINT
+# dest:        destination directory, or nil for the current one
+# overwrite:   what to do with files that already exist (OVERWRITE_*)
+# names:       masks selecting entries, all entries when nnames is 0
+# excludes:    masks of entries to leave out
+# quiet:       QUIET_NONE lists every file, QUIET_FILES only problems and the
+#              summary, QUIET_ALL nothing at all
+# versions:    also extract older file versions as name;N
+# keep_broken: keep files that failed their checksum instead of deleting them
+# progress:    show a percentage while large files are written
+# ask:         prompts are allowed (passwords, overwrites)
 pub rec Options {
-    mode:      u8;
-    dest:      *u8;
-    overwrite: u8;
-    names:     **u8;
-    nnames:    usize;
-    quiet:     bool;
-    versions:  bool;
+    mode:        u8;
+    dest:        *u8;
+    overwrite:   u8;
+    names:       **u8;
+    nnames:      usize;
+    excludes:    **u8;
+    nexcludes:   usize;
+    quiet:       u8;
+    versions:    bool;
+    keep_broken: bool;
+    progress:    bool;
+    ask:         bool;
+}
+
+# options for internal decoding with no output and no questions
+pub fun silent_options() Options {
+    var o: Options;
+    o.mode        = MODE_TEST;
+    o.dest        = nil;
+    o.overwrite   = OVERWRITE_SKIP;
+    o.names       = nil;
+    o.nnames      = 0;
+    o.excludes    = nil;
+    o.nexcludes   = 0;
+    o.quiet       = QUIET_ALL;
+    o.versions    = false;
+    o.keep_broken = false;
+    o.progress    = false;
+    o.ask         = false;
+    ret o;
 }
 
 # a link to create once all files exist
@@ -79,6 +122,17 @@ rec State {
     dirs:   Vector[Deferred];
     errors: usize;
     done:   usize;
+
+    # the first failure decides the exit status
+    worst:   E.Code;
+    skipped: usize;
+    matched: usize;
+    bytes:   u64;
+    quit:    bool;
+    # the last write showed a progress line that the report line replaces
+    prog_shown: bool;
+    # a password typed at a prompt
+    pw: [256]u8;
 }
 
 # ---------------------------------------------------------------- names
@@ -114,8 +168,13 @@ fun matches(pattern: *u8, name: *u8) bool {
 }
 
 fun selected(st: *State, e: *AR.Entry) bool {
-    if (st.opt.nnames == 0) { ret true; }
     var i: usize = 0;
+    for (i < st.opt.nexcludes) {
+        if (matches(st.opt.excludes[i], e.name)) { ret false; }
+        i = i + 1;
+    }
+    if (st.opt.nnames == 0) { ret true; }
+    i = 0;
     for (i < st.opt.nnames) {
         if (matches(st.opt.names[i], e.name)) { ret true; }
         i = i + 1;
@@ -395,14 +454,163 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
 
 # ---------------------------------------------------------------- output
 
+fun fail(st: *State, rc: E.Code) {
+    st.errors = st.errors + 1;
+    if (st.worst == E.OK) { st.worst = rc; }
+}
+
+# finish the line of a progress display before something else is printed
+fun end_progress(st: *State) {
+    if (st.prog_shown) {
+        print.print("\r");
+        st.prog_shown = false;
+    }
+}
+
 fun report(st: *State, verb: str, e: *AR.Entry, rc: E.Code) {
+    val pad: bool = st.prog_shown;
     if (rc == E.OK) {
         st.done = st.done + 1;
-        if (!st.opt.quiet && st.opt.mode != MODE_PRINT) { print.printf("{:<11} {}  OK\n", verb, e.name::str); }
+        if (st.opt.quiet == QUIET_NONE && st.opt.mode != MODE_PRINT) {
+            end_progress(st);
+            # spaces cover the percentage the progress line showed
+            if (pad) { print.printf("{:<11} {}  OK   \n", verb, e.name::str); }
+            or       { print.printf("{:<11} {}  OK\n", verb, e.name::str); }
+        }
+        st.prog_shown = false;
         ret;
     }
-    st.errors = st.errors + 1;
-    print.eprintf("{:<11} {}  FAILED: {}\n", verb, e.name::str, E.message(rc));
+    fail(st, rc);
+    if (st.opt.quiet != QUIET_ALL) {
+        if (pad) { print.println(""); }
+        print.eprintf("{:<11} {}  FAILED: {}\n", verb, e.name::str, E.message(rc));
+    }
+    st.prog_shown = false;
+}
+
+fun note_skip(st: *State, e: *AR.Entry, why: str) {
+    st.skipped = st.skipped + 1;
+    if (st.opt.quiet == QUIET_NONE) { print.printf("{:<11} {}  {}\n", "Skipping", e.name::str, why); }
+}
+
+# ask for a password at the terminal; false when nobody can be asked
+fun ask_password(st: *State, e: *AR.Entry, again: bool) bool {
+    if (!st.opt.ask || !TT.available()) { ret false; }
+    end_progress(st);
+    if (again) { print.eprintln("The password is incorrect."); }
+    print.eprintf("Enter password for {}", e.name::str);
+    val n: i64 = TT.prompt(": ", ?st.pw[0], 256, true);
+    if (n <= 0) { ret false; }
+    st.ar.password = ?st.pw[0];
+    st.ar.pw_len   = n::usize;
+    st.key_valid   = false;
+    st.key4_valid  = false;
+    ret true;
+}
+
+# derive the entry's keys, asking for a password while it is missing or
+# wrong (up to three tries)
+fun unlock(st: *State, e: *AR.Entry) E.Code {
+    if (!e.h.crypt.present) { ret E.OK; }
+    var tries: u32 = 0;
+    for {
+        var rc: E.Code = E.OK;
+        if (e.h.crypt.rar4)                                           { rc = entry_keys4(st, e); }
+        or                                                            { rc = entry_keys(st, e); }
+        if (rc != E.NEED_PASSWORD && rc != E.BAD_PASSWORD)            { ret rc; }
+        if (tries == 3 || !ask_password(st, e, rc == E.BAD_PASSWORD)) { ret rc; }
+        tries = tries + 1;
+    }
+    ret E.OK;
+}
+
+# an output name that does not exist yet: "name (1).ext", "name (2).ext", ...
+fun free_name(path: *u8) *u8 {
+    val n:   usize = M.cstr_len(path);
+    var dot: usize = n;
+    var k:   usize = n;
+    for (k > 0 && path[k - 1] != '/') {
+        if (path[k - 1] == '.' && dot == n && k - 1 > 0 && path[k - 2] != '/') { dot = k - 1; }
+        k = k - 1;
+    }
+    var num: u32 = 1;
+    for (num < 10000) {
+        val out: *u8 = M.alloc(n + 16);
+        if (out == nil) { ret nil; }
+        M.copy(out, path, dot);
+        var o: usize = dot;
+        out[o]     = ' ';
+        out[o + 1] = '(';
+        o          = o + 2;
+        var digits: [8]u8;
+        var nd:     usize = 0;
+        var v:      u32   = num;
+        for (v > 0) {
+            digits[nd] = ('0'::u32 + v % 10)::u8;
+            v          = v / 10;
+            nd         = nd + 1;
+        }
+        for (nd > 0) {
+            nd     = nd - 1;
+            out[o] = digits[nd];
+            o      = o + 1;
+        }
+        out[o] = ')';
+        o      = o + 1;
+        M.copy(?out[o], ?path[dot], n - dot);
+        out[o + n - dot] = 0;
+        if (!path_exists(out)) { ret out; }
+        num = num + 1;
+    }
+    ret nil;
+}
+
+val WRITE_IT: u8 = 0;
+val SKIP_IT:  u8 = 1;
+
+# decide about an output path that already exists; may replace @path with a
+# renamed one
+fun existing(st: *State, path: **u8) u8 {
+    if (!path_exists(@path)) { ret WRITE_IT; }
+    var mode: u8 = st.opt.overwrite;
+    if (mode == OVERWRITE_ASK) {
+        end_progress(st);
+        print.eprintf("\n{} already exists.\n", (@path)::str);
+        var answer: [16]u8;
+        val n:      i64 = TT.prompt("Overwrite? [Y]es, [N]o, [A]ll, n[E]ver, [R]ename, [Q]uit: ", ?answer[0], 16, false);
+        var c:      u8  = 0;
+        if (n > 0) { c = answer[0] | 0x20; }
+        if (n < 0) {
+            # no terminal: nobody to ask, so leave the file alone
+            mode = OVERWRITE_SKIP;
+        }
+        or (c == 'y') { mode = OVERWRITE_ALL; }
+        or (c == 'a') {
+            mode             = OVERWRITE_ALL;
+            st.opt.overwrite = OVERWRITE_ALL;
+        }
+        or (c == 'e') {
+            mode             = OVERWRITE_SKIP;
+            st.opt.overwrite = OVERWRITE_SKIP;
+        }
+        or (c == 'r') { mode = OVERWRITE_RENAME; }
+        or (c == 'q') {
+            st.quit = true;
+            ret SKIP_IT;
+        }
+        or { mode = OVERWRITE_SKIP; }
+    }
+    if (mode == OVERWRITE_ALL) {
+        fs.remove_file((@path)::str);
+        ret WRITE_IT;
+    }
+    if (mode == OVERWRITE_RENAME) {
+        val other: *u8 = free_name(@path);
+        if (other == nil) { ret SKIP_IT; }
+        @path = other;
+        ret WRITE_IT;
+    }
+    ret SKIP_IT;
 }
 
 fun apply_metadata(e: *AR.Entry, path: *u8) {
@@ -421,25 +629,25 @@ fun apply_metadata(e: *AR.Entry, path: *u8) {
 
 fun write_file(st: *State, e: *AR.Entry, path: *u8) E.Code {
     if (!make_parents(path)) { ret E.CREATE; }
-    if (path_exists(path)) {
-        if (st.opt.overwrite != OVERWRITE_ALL) { ret E.OK; }
-        fs.remove_file(path::str);
-    }
     val fr: res[fs.File, io_error.Error] = fs.create(path::str, 0x1A4);
     if (sel fr.err) { ret E.CREATE; }
     var f:    fs.File = fr.ok;
     var sink: S.Sink;
     S.sink_init(?sink, S.SINK_FD, f.handle.value, e.h.has_blake2);
+    if (st.opt.progress && st.opt.quiet == QUIET_NONE) { S.sink_progress(?sink, "Extracting", e.name, e.h.unp_size); }
     val rc: E.Code = unpack_entry(st, e, ?sink);
+    st.prog_shown = sink.prog_shown;
     fs.close(?f);
     if (rc == E.OK && sink.failed) {
         fs.remove_file(path::str);
         ret E.WRITE;
     }
     if (rc != E.OK) {
-        fs.remove_file(path::str);
+        # a damaged file is kept only on request, and never a write failure
+        if (!st.opt.keep_broken || sink.failed) { fs.remove_file(path::str); }
         ret rc;
     }
+    st.bytes = st.bytes + sink.written;
     apply_metadata(e, path);
     ret E.OK;
 }
@@ -500,9 +708,6 @@ fun extract_link(st: *State, e: *AR.Entry, i: usize, path: *u8) E.Code {
     }
     if (e.link == nil)       { ret E.BAD_HEADER; }
     if (!make_parents(path)) { ret E.CREATE; }
-    if (path_exists(path)) {
-        if (st.opt.overwrite != OVERWRITE_ALL) { ret E.OK; }
-    }
 
     if (t == H.REDIR_UNIX_SYMLINK || t == H.REDIR_WIN_SYMLINK || t == H.REDIR_JUNCTION) {
         var d: Deferred;
@@ -570,6 +775,17 @@ fun solid_successor(ar: *AR.Archive, i: usize) bool {
     ret false;
 }
 
+# decode an entry nobody wants, when a later solid file depends on it
+fun skip_data(st: *State, i: usize) {
+    val e: *AR.Entry = AR.entry(st.ar, i);
+    if (e.h.method != 0 && !AR.is_dir(e) && solid_successor(st.ar, i)) {
+        if (e.h.crypt.present && unlock(st, e) != E.OK) { ret; }
+        var sink: S.Sink;
+        S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
+        unpack_entry(st, e, ?sink);
+    }
+}
+
 fun process(st: *State, i: usize) {
     val ar: *AR.Archive = st.ar;
     val e:  *AR.Entry   = AR.entry(ar, i);
@@ -579,14 +795,10 @@ fun process(st: *State, i: usize) {
     val mode: u8   = st.opt.mode;
 
     if (!want) {
-        # keep a solid stream intact by decoding what a later file needs
-        if (e.h.method != 0 && !AR.is_dir(e) && e.h.redir_type == H.REDIR_NONE && solid_successor(ar, i)) {
-            var sink: S.Sink;
-            S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
-            unpack_entry(st, e, ?sink);
-        }
+        skip_data(st, i);
         ret;
     }
+    st.matched = st.matched + 1;
 
     if (mode == MODE_TEST || mode == MODE_PRINT) {
         if (AR.is_dir(e)) { ret; }
@@ -595,14 +807,22 @@ fun process(st: *State, i: usize) {
             if (mode == MODE_TEST) { report(st, "Testing", e, E.OK); }
             ret;
         }
+        val uc: E.Code = unlock(st, e);
+        if (uc != E.OK) {
+            report(st, "Testing", e, uc);
+            ret;
+        }
         var sink: S.Sink;
         if (mode == MODE_PRINT) {
             S.sink_init(?sink, S.SINK_FD, 1, e.h.has_blake2);
         }
         or {
             S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
+            if (st.opt.progress && st.opt.quiet == QUIET_NONE) { S.sink_progress(?sink, "Testing", e.name, e.h.unp_size); }
         }
         val rc: E.Code = unpack_entry(st, e, ?sink);
+        st.prog_shown = sink.prog_shown;
+        if (rc == E.OK)        { st.bytes = st.bytes + sink.written; }
         if (mode == MODE_TEST) { report(st, "Testing", e, rc); }
         or                     { report(st, "Printing", e, rc); }
         ret;
@@ -612,14 +832,10 @@ fun process(st: *State, i: usize) {
     val rel: *u8 = safe_name(e, mode == MODE_FLAT);
     if (rel == nil) {
         report(st, "Extracting", e, E.UNSAFE_PATH);
-        if (e.h.method != 0 && solid_successor(ar, i)) {
-            var sink: S.Sink;
-            S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
-            unpack_entry(st, e, ?sink);
-        }
+        skip_data(st, i);
         ret;
     }
-    val path: *u8 = join(st.opt.dest, rel);
+    var path: *u8 = join(st.opt.dest, rel);
     if (path == nil) {
         report(st, "Extracting", e, E.NO_MEMORY);
         ret;
@@ -637,6 +853,18 @@ fun process(st: *State, i: usize) {
             V.push[Deferred](?st.dirs, d);
         }
         report(st, "Creating", e, rc);
+        ret;
+    }
+
+    if (existing(st, ?path) == SKIP_IT) {
+        if (!st.quit) { note_skip(st, e, "exists"); }
+        skip_data(st, i);
+        ret;
+    }
+    val uc: E.Code = unlock(st, e);
+    if (uc != E.OK) {
+        report(st, "Extracting", e, uc);
+        skip_data(st, i);
         ret;
     }
     if (e.h.redir_type != H.REDIR_NONE) {
@@ -658,15 +886,8 @@ pub fun load_comment(ar: *AR.Archive) {
         val e: *AR.Entry = AR.entry(ar, i);
         if (e.service && M.cstr_eq(e.name, "CMT"::*u8) && e.h.unp_size > 0 && e.h.unp_size < 0x40000 &&
             !e.h.crypt.present) {
-            var opt: Options;
-            opt.mode      = MODE_TEST;
-            opt.dest      = nil;
-            opt.overwrite = OVERWRITE_SKIP;
-            opt.names     = nil;
-            opt.nnames    = 0;
-            opt.quiet     = true;
-            opt.versions  = false;
-            var st: State;
+            var opt: Options = silent_options();
+            var st:  State;
             st.ar  = ar;
             st.opt = ?opt;
             U.init(?st.unp);
@@ -695,6 +916,14 @@ pub fun load_comment(ar: *AR.Archive) {
     }
 }
 
+fun print_size(n: u64) {
+    if (n < 10000)               { print.printf("{} bytes", n); }
+    or (n < 10000 * 1024)        { print.printf("{} KB", (n + 512) / 1024); }
+    or (n < 10000 * 1024 * 1024) { print.printf("{}.{} MB", n / 1048576, (n % 1048576) * 10 / 1048576); }
+    or                           { print.printf("{}.{} GB", n / 1073741824, (n % 1073741824) * 10 / 1073741824); }
+}
+
+# process the archive; the result is the process exit status
 pub fun run(ar: *AR.Archive, opt: *Options) i64 {
     var st: State;
     st.ar  = ar;
@@ -707,13 +936,20 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
     st.dirs       = V.init[Deferred](M.allocator());
     st.errors     = 0;
     st.done       = 0;
+    st.worst      = E.OK;
+    st.skipped    = 0;
+    st.matched    = 0;
+    st.bytes      = 0;
+    st.quit       = false;
+    st.prog_shown = false;
+    val started: i64 = TT.millis();
 
     if (opt.dest != nil && opt.dest[0] != 0 && (opt.mode == MODE_EXTRACT || opt.mode == MODE_FLAT)) {
         fs.create_dir_all(M.allocator(), opt.dest::str, 0x1ED);
     }
 
     var i: usize = 0;
-    for (i < ar.entries.len) {
+    for (i < ar.entries.len && !st.quit) {
         process(?st, i);
         i = i + 1;
     }
@@ -721,24 +957,46 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
     U.dnit(?st.unp);
     U4.dnit(?st.unp4);
 
+    val loud: bool = opt.quiet != QUIET_ALL;
     if (ar.bad_headers > 0) {
-        print.eprintf("ramjet: {} damaged header(s)\n", ar.bad_headers);
-        st.errors = st.errors + 1;
+        if (loud) { print.eprintf("ramjet: {} damaged header(s)\n", ar.bad_headers); }
+        fail(?st, E.HEADER_CRC);
     }
     if (ar.truncated) {
-        print.eprintln("ramjet: archive is truncated");
-        st.errors = st.errors + 1;
+        if (loud) { print.eprintln("ramjet: archive is truncated"); }
+        fail(?st, E.TRUNCATED);
     }
     if (ar.missing_volume) {
-        print.eprintln("ramjet: a following volume is missing");
-        st.errors = st.errors + 1;
+        if (loud) { print.eprintln("ramjet: a following volume is missing"); }
+        fail(?st, E.MISSING_VOLUME);
     }
-    if (st.errors > 0) {
-        print.eprintf("ramjet: {} error(s)\n", st.errors);
-        ret 1;
+    if (st.quit) {
+        if (loud) { print.eprintln("ramjet: stopped"); }
+        ret E.exit_code(E.USER_BREAK);
     }
-    if (!opt.quiet && opt.mode != MODE_PRINT) { print.println("All OK"); }
-    ret 0;
+    if (st.matched == 0 && (opt.nnames > 0 || opt.nexcludes > 0)) {
+        if (loud)             { print.eprintln("ramjet: no files matched"); }
+        if (st.worst == E.OK) { st.worst = E.NO_FILES; }
+        ret E.exit_code(st.worst);
+    }
+
+    if (loud && opt.mode != MODE_PRINT) {
+        val ms: i64 = TT.millis() - started;
+        if (st.errors > 0) {
+            print.eprintf("{} error(s)", st.errors);
+            if (st.done > 0) { print.eprintf(", {} file(s) OK", st.done); }
+            print.eprintln("");
+        }
+        or (opt.quiet == QUIET_NONE || st.skipped > 0) {
+            if (opt.mode == MODE_TEST) { print.print("All OK: "); }
+            or                         { print.print("Done: "); }
+            print.printf("{} file(s), ", st.done);
+            print_size(st.bytes);
+            if (st.skipped > 0) { print.printf(", {} skipped", st.skipped); }
+            print.printf(" in {}.{} s\n", ms / 1000, (ms % 1000) / 100);
+        }
+    }
+    ret E.exit_code(st.worst);
 }
 
 test extract__matches {

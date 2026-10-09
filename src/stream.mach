@@ -8,11 +8,13 @@
 # has one, BLAKE2sp, and writes them to a file, to stdout or nowhere.
 
 use ramjet.crypto.crc32;
+use std.print;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 
 use AR: ramjet.archive;
 use ramjet.crypto.aes;
@@ -148,6 +150,14 @@ pub rec Sink {
     failed:     bool;
     mem:        *u8;
     mem_cap:    usize;
+
+    # progress shown on the terminal while a large file is written
+    prog_on:    bool;
+    prog_total: u64;
+    prog_next:  u64;
+    prog_shown: bool;
+    prog_verb:  str;
+    prog_name:  *u8;
 }
 
 pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
@@ -156,10 +166,34 @@ pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
     s.crc        = crc32.init();
     s.use_blake2 = blake2;
     if (blake2) { b2.sp_init(?s.blake2); }
-    s.written = 0;
-    s.failed  = false;
-    s.mem     = nil;
-    s.mem_cap = 0;
+    s.written    = 0;
+    s.failed     = false;
+    s.mem        = nil;
+    s.mem_cap    = 0;
+    s.prog_on    = false;
+    s.prog_shown = false;
+}
+
+# show "<verb> <name>  NN%" on stdout as data arrives, for files of `total`
+# bytes; only worth it for files big enough to take a moment
+pub fun sink_progress(s: *Sink, verb: str, name: *u8, total: u64) {
+    if (total < 0x400000) { ret; }
+    s.prog_on    = true;
+    s.prog_total = total;
+    s.prog_next  = 0;
+    s.prog_verb  = verb;
+    s.prog_name  = name;
+}
+
+fun progress(s: *Sink) {
+    val pct: u64 = s.written * 100 / s.prog_total;
+    if (pct > 99) { ret; }
+    print.printf("\r{:<11} {}  {:3}%", s.prog_verb, s.prog_name::str, pct);
+    s.prog_shown = true;
+    # next update after another percent, but not more often than every 1 MB
+    var step: u64 = s.prog_total / 100;
+    if (step < 0x100000) { step = 0x100000; }
+    s.prog_next = s.written + step;
 }
 
 # collect up to cap bytes in memory; more than that marks the sink failed
@@ -182,6 +216,7 @@ pub fun sink_write(s: *Sink, p: *u8, n: usize) {
         }
     }
     s.written = s.written + n::u64;
+    if (s.prog_on && s.written >= s.prog_next) { progress(s); }
     if (s.mode == SINK_FD && !s.failed) {
         var off: usize = 0;
         for (off < n) {

@@ -1,145 +1,305 @@
 # ramjet command line
 #
-#   ramjet l  [-p<pwd>] <archive>             list contents
-#   ramjet lt [-p<pwd>] <archive>             list with technical details
-#   ramjet t  [-p<pwd>] <archive>             test integrity
-#   ramjet x  [-p<pwd>] [-o+|-o-] <archive> [dest/]   extract with paths
-#   ramjet e  [-p<pwd>] [-o+|-o-] <archive> [dest/]   extract without paths
-#   ramjet p  [-p<pwd>] <archive> [name]      print file data to stdout
+#   ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]
+#
+# switches may appear anywhere until "--". a last argument ending in a path
+# separator is the destination of x and e; other arguments after the archive
+# select files by name or mask.
 
 use std.print;
 use std.runtime;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+
+use V: std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
 
 use AR: ramjet.archive;
 use E:  ramjet.errors;
 use X:  ramjet.extract;
 use L:  ramjet.list;
 use M:  ramjet.mem;
-use H:  ramjet.rar5.header;
-use T:  ramjet.timefmt;
+use TT: ramjet.tty;
 
-fun usage() i64 {
-    print.eprintln("Ramjet 0.1.0 - clean-room RAR reader");
-    print.eprintln("usage: ramjet <command> [switches] <archive> [args]");
-    print.eprintln("commands:");
-    print.eprintln("  l    list archive contents");
-    print.eprintln("  lt   list with technical details");
-    print.eprintln("  t    test archive files");
-    print.eprintln("  x    extract files with full paths");
-    print.eprintln("  e    extract files without paths");
-    print.eprintln("  p    print file data to stdout");
-    print.eprintln("switches:");
-    print.eprintln("  -p<password>  set password");
-    print.eprintln("  -o+ / -o-     overwrite / skip existing files");
-    print.eprintln("  -ver          also extract older file versions as name;N");
-    ret 2;
+# the version in mach.toml, so a release tag, the manifest and the binary agree
+val VERSION: str = $project.version;
+
+fun usage() {
+    print.println("Ramjet - a clean-room RAR reader");
+    print.println("");
+    print.println("usage: ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]");
+    print.println("");
+    print.println("commands:");
+    print.println("  l             list archive contents");
+    print.println("  lt            list with technical details");
+    print.println("  lb            list bare file names");
+    print.println("  t             test archive files");
+    print.println("  x             extract files with full paths");
+    print.println("  e             extract files without paths");
+    print.println("  p             print file data to stdout");
+    print.println("");
+    print.println("switches:");
+    print.println("  -p<password>  set the password (-p alone asks for it, -p- never asks)");
+    print.println("  -o+           overwrite existing files");
+    print.println("  -o-           skip existing files");
+    print.println("  -or           rename extracted files when the name exists");
+    print.println("  -y            assume yes on all questions");
+    print.println("  -x<mask>      exclude files (repeatable; -x@<file> reads masks from a file)");
+    print.println("  -op<path>     extract into this directory");
+    print.println("  -ad           extract into a directory named after the archive");
+    print.println("  -kb           keep files that failed their checksum");
+    print.println("  -ver          also extract older file versions as name;N");
+    print.println("  -idq, -q      only show errors and the summary");
+    print.println("  -inul         show nothing");
+    print.println("  -idp          no progress percentage");
+    print.println("  --            stop reading switches");
+    print.println("  -h, --help    this help;  --version  version");
+    print.println("");
+    print.println("exit status: 0 ok, 1 warning, 2 fatal error, 3 damaged data, 5 write error,");
+    print.println("6 open error, 7 bad command line, 8 out of memory, 9 cannot create file,");
+    print.println("10 no files matched, 11 wrong password, 255 stopped");
+}
+
+fun bad_usage(what: str, arg: *u8) i64 {
+    print.eprintf("ramjet: {} {}\n", what, arg::str);
+    print.eprintln("try 'ramjet --help'");
+    ret E.exit_code(E.USAGE);
+}
+
+fun starts(a: *u8, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (a[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun is_sep(c: u8) bool {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret c == '/' || c == '\\';
+    }
+    $or {
+        ret c == '/';
+    }
+}
+
+# append the lines of a list file (one name or mask per line) to v
+fun read_list(path: *u8, v: *Vector[*u8]) bool {
+    val r: res[Vector[u8], fs.FsError] = fs.read_bytes(M.allocator(), path::str);
+    if (sel r.err) { ret false; }
+    var data: Vector[u8] = r.ok;
+    var i:    usize      = 0;
+    for (i < data.len) {
+        var j: usize = i;
+        for (j < data.len && data.data[j] != '\n') { j = j + 1; }
+        var end: usize = j;
+        if (end > i && data.data[end - 1] == '\r') { end = end - 1; }
+        if (end > i)                               { V.push[*u8](v, M.dup(?data.data[i], end - i)); }
+        i = j + 1;
+    }
+    V.dnit[u8](?data);
+    ret true;
+}
+
+# the archive's base name without its .rar / .partN.rar extension, for -ad
+fun archive_stem(path: *u8) *u8 {
+    val n:     usize = M.cstr_len(path);
+    var start: usize = n;
+    for (start > 0 && !is_sep(path[start - 1])) { start = start - 1; }
+    var end: usize = n;
+    if (end - start > 4 && path[end - 4] == '.' && (path[end - 3] | 0x20) == 'r' && (path[end - 2] | 0x20) == 'a' &&
+        (path[end - 1] | 0x20) == 'r') {
+        end = end - 4;
+        # drop ".partN" as well
+        var k: usize = end;
+        for (k > start && path[k - 1] >= '0' && path[k - 1] <= '9') { k = k - 1; }
+        if (k < end && k >= start + 5 && path[k - 5] == '.' && (path[k - 4] | 0x20) == 'p' && (path[k - 3] | 0x20) == 'a' &&
+            (path[k - 2] | 0x20) == 'r' && (path[k - 1] | 0x20) == 't') {
+            end = k - 5;
+        }
+    }
+    if (end <= start) { end = n; }
+    ret M.dup(?path[start], end - start);
+}
+
+fun join_dir(a: *u8, b: *u8) *u8 {
+    if (a == nil || a[0] == 0) { ret M.dup(b, M.cstr_len(b)); }
+    val an:  usize = M.cstr_len(a);
+    val bn:  usize = M.cstr_len(b);
+    val out: *u8   = M.alloc(an + bn + 3);
+    M.copy(out, a, an);
+    var o: usize = an;
+    if (!is_sep(a[an - 1])) {
+        out[o] = '/';
+        o      = o + 1;
+    }
+    M.copy(?out[o], b, bn);
+    out[o + bn]     = '/';
+    out[o + bn + 1] = 0;
+    ret out;
+}
+
+# open the archive, asking for the password of encrypted headers
+fun open_archive(ar: *AR.Archive, path: *u8, password: *u8, ask: bool, pw: *u8) E.Code {
+    var tries: u32 = 0;
+    var given: *u8 = password;
+    for {
+        val rc: E.Code = AR.open(ar, path, given);
+        if ((rc != E.NEED_PASSWORD && rc != E.BAD_PASSWORD) || !ask || tries == 3 || !TT.available()) { ret rc; }
+        AR.close(ar);
+        if (rc == E.BAD_PASSWORD) { print.eprintln("The password is incorrect."); }
+        print.eprintf("Enter password for {}", path::str);
+        if (TT.prompt(": ", pw, 256, true) <= 0) { ret rc; }
+        given = pw;
+        tries = tries + 1;
+    }
+    ret E.OK;
 }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    if (argc < 3) { ret usage(); }
     if (!M.init()) {
         print.eprintln("ramjet: cannot set up memory");
-        ret 1;
+        ret E.exit_code(E.NO_MEMORY);
+    }
+    if (argc < 2) {
+        usage();
+        ret E.exit_code(E.USAGE);
+    }
+    val cmd: *u8 = argv[1];
+    if (M.cstr_eq(cmd, "--help"::*u8) || M.cstr_eq(cmd, "-h"::*u8) || M.cstr_eq(cmd, "-?"::*u8) ||
+        M.cstr_eq(cmd, "h"::*u8) || M.cstr_eq(cmd, "help"::*u8)) {
+        usage();
+        ret 0;
+    }
+    if (M.cstr_eq(cmd, "--version"::*u8) || M.cstr_eq(cmd, "-V"::*u8)) {
+        print.printf("ramjet {}\n", VERSION);
+        ret 0;
     }
 
-    val cmd:        *u8  = argv[1];
-    var password:   *u8  = nil;
-    var archive:    *u8  = nil;
-    var rest_first: i64  = argc;
-    var overwrite:  u8   = 0;
-    var versions:   bool = false;
+    var mode:      u8   = 0;
+    var list:      bool = false;
+    var technical: bool = false;
+    var bare:      bool = false;
+    if (M.cstr_eq(cmd, "l"::*u8)) { list = true; }
+    or (M.cstr_eq(cmd, "lt"::*u8)) {
+        list      = true;
+        technical = true;
+    }
+    or (M.cstr_eq(cmd, "lb"::*u8)) {
+        list = true;
+        bare = true;
+    }
+    or (M.cstr_eq(cmd, "t"::*u8)) { mode = X.MODE_TEST; }
+    or (M.cstr_eq(cmd, "x"::*u8)) { mode = X.MODE_EXTRACT; }
+    or (M.cstr_eq(cmd, "e"::*u8)) { mode = X.MODE_FLAT; }
+    or (M.cstr_eq(cmd, "p"::*u8)) { mode = X.MODE_PRINT; }
+    or                            { ret bad_usage("unknown command", cmd); }
+
+    var opt: X.Options = X.silent_options();
+    opt.mode     = mode;
+    opt.quiet    = X.QUIET_NONE;
+    opt.progress = TT.is_terminal(1) && mode != X.MODE_PRINT;
+    opt.ask      = true;
+    # without a terminal there is nobody to ask, so existing files are kept
+    opt.overwrite = X.OVERWRITE_SKIP;
+    if (TT.available()) { opt.overwrite = X.OVERWRITE_ASK; }
+
+    var password:   *u8         = nil;
+    var ask_now:    bool        = false;
+    var archive:    *u8         = nil;
+    var out_path:   *u8         = nil;
+    var by_archive: bool        = false;
+    var names:      Vector[*u8] = V.init[*u8](M.allocator());
+    var excludes:   Vector[*u8] = V.init[*u8](M.allocator());
+    var rest:       Vector[*u8] = V.init[*u8](M.allocator());
+    var switches:   bool        = true;
 
     var i: i64 = 2;
     for (i < argc) {
         val a: *u8 = argv[i];
-        if (archive == nil && a[0] == '-' && a[1] == 'p') {
-            password = ?a[2];
-        }
-        or (archive == nil && a[0] == '-' && a[1] == 'o' && a[2] == '+') {
-            overwrite = 1;
-        }
-        or (archive == nil && a[0] == '-' && a[1] == 'o' && a[2] == '-') {
-            overwrite = 2;
-        }
-        or (archive == nil && M.cstr_eq(a, "-ver"::*u8)) {
-            versions = true;
-        }
-        or (archive == nil && a[0] == '-' && a[1] == '-' && a[2] == 0) {
-            # end of switches
-        }
-        or (archive == nil) {
-            archive    = a;
-            rest_first = i + 1;
-        }
-        or {
-            brk;
-        }
         i = i + 1;
+        if (switches && a[0] == '-' && a[1] != 0) {
+            if (M.cstr_eq(a, "--"::*u8))                             { switches = false; }
+            or (M.cstr_eq(a, "-p-"::*u8))                            { opt.ask = false; }
+            or (M.cstr_eq(a, "-p"::*u8))                             { ask_now = true; }
+            or (a[1] == 'p' && a[2] != 0 && !starts(a, "-op"))       { password = ?a[2]; }
+            or (M.cstr_eq(a, "-o+"::*u8) || M.cstr_eq(a, "-y"::*u8)) { opt.overwrite = X.OVERWRITE_ALL; }
+            or (M.cstr_eq(a, "-o-"::*u8))                            { opt.overwrite = X.OVERWRITE_SKIP; }
+            or (M.cstr_eq(a, "-or"::*u8))                            { opt.overwrite = X.OVERWRITE_RENAME; }
+            or (starts(a, "-x@") && a[3] != 0) {
+                if (!read_list(?a[3], ?excludes)) { ret bad_usage("cannot read list file", ?a[3]); }
+            }
+            or (a[1] == 'x' && a[2] != 0)                             { V.push[*u8](?excludes, ?a[2]); }
+            or (starts(a, "-op") && a[3] != 0)                        { out_path = ?a[3]; }
+            or (M.cstr_eq(a, "-ad"::*u8))                             { by_archive = true; }
+            or (M.cstr_eq(a, "-kb"::*u8))                             { opt.keep_broken = true; }
+            or (M.cstr_eq(a, "-ver"::*u8))                            { opt.versions = true; }
+            or (M.cstr_eq(a, "-idq"::*u8) || M.cstr_eq(a, "-q"::*u8)) { opt.quiet = X.QUIET_FILES; }
+            or (M.cstr_eq(a, "-inul"::*u8))                           { opt.quiet = X.QUIET_ALL; }
+            or (M.cstr_eq(a, "-idp"::*u8))                            { opt.progress = false; }
+            or                                                        { ret bad_usage("unknown switch", a); }
+            cnt;
+        }
+        if (archive == nil) {
+            archive = a;
+            cnt;
+        }
+        V.push[*u8](?rest, a);
     }
-    if (archive == nil) { ret usage(); }
+    if (archive == nil)           { ret bad_usage("no archive given", ""::*u8); }
+    if (opt.quiet == X.QUIET_ALL) { opt.progress = false; }
+
+    # a trailing separator marks the destination of x and e
+    if ((mode == X.MODE_EXTRACT || mode == X.MODE_FLAT) && rest.len > 0) {
+        val last: *u8   = rest.data[rest.len - 1];
+        val n:    usize = M.cstr_len(last);
+        if (n > 0 && is_sep(last[n - 1])) {
+            opt.dest = last;
+            rest.len = rest.len - 1;
+        }
+    }
+    if (out_path != nil) { opt.dest = out_path; }
+    if (by_archive)      { opt.dest = join_dir(opt.dest, archive_stem(archive)); }
+    var k: usize = 0;
+    for (k < rest.len) {
+        val a: *u8 = rest.data[k];
+        if (a[0] == '@' && a[1] != 0) {
+            if (!read_list(?a[1], ?names)) { ret bad_usage("cannot read list file", ?a[1]); }
+        }
+        or { V.push[*u8](?names, a); }
+        k = k + 1;
+    }
+    opt.names     = names.data;
+    opt.nnames    = names.len;
+    opt.excludes  = excludes.data;
+    opt.nexcludes = excludes.len;
+
+    var pw: [256]u8;
+    if (ask_now && password == nil && TT.available()) {
+        print.eprint("Enter password");
+        if (TT.prompt(": ", ?pw[0], 256, true) > 0) { password = ?pw[0]; }
+    }
 
     var ar: AR.Archive;
-    val rc: E.Code = AR.open(?ar, archive, password);
+    val rc: E.Code = open_archive(?ar, archive, password, opt.ask, ?pw[0]);
     if (rc != E.OK) {
-        print.eprintf("ramjet: {}: {}\n", archive::str, E.message(rc));
-        ret 1;
+        if (opt.quiet != X.QUIET_ALL) { print.eprintf("ramjet: {}: {}\n", archive::str, E.message(rc)); }
+        ret E.exit_code(rc);
     }
 
     var status: i64 = 0;
-    if (M.cstr_eq(cmd, "l"::*u8) || M.cstr_eq(cmd, "lt"::*u8)) { X.load_comment(?ar); }
-    if (M.cstr_eq(cmd, "l"::*u8)) {
-        status = L.list(?ar, archive, false);
-    }
-    or (M.cstr_eq(cmd, "lt"::*u8)) {
-        status = L.list(?ar, archive, true);
+    if (list) {
+        X.load_comment(?ar);
+        status = L.list(?ar, archive, technical, bare);
     }
     or {
-        var opt: X.Options;
-        opt.dest      = nil;
-        opt.overwrite = X.OVERWRITE_SKIP;
-        if (overwrite == 1) { opt.overwrite = X.OVERWRITE_ALL; }
-        opt.names    = nil;
-        opt.nnames   = 0;
-        opt.quiet    = false;
-        opt.versions = versions;
-        var rest: i64 = rest_first;
-        if (M.cstr_eq(cmd, "t"::*u8)) {
-            opt.mode = X.MODE_TEST;
-        }
-        or (M.cstr_eq(cmd, "x"::*u8) || M.cstr_eq(cmd, "e"::*u8)) {
-            opt.mode = X.MODE_EXTRACT;
-            if (cmd[0] == 'e') { opt.mode = X.MODE_FLAT; }
-            # a last argument ending in '/' is the destination
-            if (argc > rest) {
-                val last: *u8   = argv[argc - 1];
-                val n:    usize = M.cstr_len(last);
-                if (n > 0 && last[n - 1] == '/') {
-                    opt.dest = last;
-                    argc     = argc - 1;
-                }
-                or (argc - rest == 1 && n > 0) {
-                    opt.dest = last;
-                    argc     = argc - 1;
-                }
-            }
-        }
-        or (M.cstr_eq(cmd, "p"::*u8)) {
-            opt.mode = X.MODE_PRINT;
-        }
-        or {
-            AR.close(?ar);
-            ret usage();
-        }
-        if (argc > rest) {
-            opt.names  = ?argv[rest];
-            opt.nnames = (argc - rest)::usize;
-        }
         status = X.run(?ar, ?opt);
     }
     AR.close(?ar);
