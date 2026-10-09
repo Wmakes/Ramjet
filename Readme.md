@@ -61,6 +61,8 @@ Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what 
 * file times and Unix permissions (Linux) or attributes (Windows) are restored; set-id bits never are
 * builds for Linux, Windows and macOS (Windows tested under Wine)
 
+Known limitation: encrypted archives made by RAR 3.0–3.4 may not decrypt (RAR 3.5 and later are fine).
+
 Not yet: verified RAR 1.5 support, archives older than RAR 1.5, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
 
 See [`docs/clean-room-notes.md`](docs/clean-room-notes.md) for where every piece of format knowledge came from.
