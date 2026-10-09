@@ -1,0 +1,138 @@
+# bounds-checked little-endian byte reader
+#
+# every read past the end of the buffer yields zero and latches `bad`, so a
+# parser can read a whole header and test `bad` once at the end instead of
+# checking every field.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# a read position inside a borrowed byte range
+# ---
+# data: first byte of the range
+# len:  bytes in the range
+# pos:  next byte to read
+# bad:  set once any read ran past the end or a vint was malformed
+pub rec Cursor {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+# a cursor over len bytes at data
+pub fun cursor(data: *u8, len: usize) Cursor {
+    ret Cursor{data: data, len: len, pos: 0, bad: false};
+}
+
+# bytes left to read
+pub fun remaining(c: *Cursor) usize {
+    if (c.pos >= c.len) { ret 0; }
+    ret c.len - c.pos;
+}
+
+# address of the next byte, for fields read in place
+pub fun here(c: *Cursor) *u8 {
+    ret ?c.data[c.pos];
+}
+
+# skip n bytes
+pub fun skip(c: *Cursor, n: u64) {
+    if (n > remaining(c)::u64) {
+        c.pos = c.len;
+        c.bad = true;
+        ret;
+    }
+    c.pos = c.pos + n::usize;
+}
+
+pub fun read_u8(c: *Cursor) u8 {
+    if (c.pos >= c.len) {
+        c.bad = true;
+        ret 0;
+    }
+    val b: u8 = c.data[c.pos];
+    c.pos = c.pos + 1;
+    ret b;
+}
+
+pub fun read_u16(c: *Cursor) u16 {
+    val lo: u16 = read_u8(c)::u16;
+    val hi: u16 = read_u8(c)::u16;
+    ret lo | (hi << 8);
+}
+
+pub fun read_u32(c: *Cursor) u32 {
+    val lo: u32 = read_u16(c)::u32;
+    val hi: u32 = read_u16(c)::u32;
+    ret lo | (hi << 16);
+}
+
+pub fun read_u64(c: *Cursor) u64 {
+    val lo: u64 = read_u32(c)::u64;
+    val hi: u64 = read_u32(c)::u64;
+    ret lo | (hi << 32);
+}
+
+# copy n bytes out of the cursor
+pub fun read_into(c: *Cursor, dst: *u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        dst[i] = read_u8(c);
+        i      = i + 1;
+    }
+}
+
+# variable-length integer: 7 data bits per byte, low group first, the high bit
+# set on every byte but the last. at most 10 bytes carry a 64-bit value.
+pub fun read_vint(c: *Cursor) u64 {
+    var value: u64 = 0;
+    var shift: u64 = 0;
+    for (shift < 70) {
+        val b: u8 = read_u8(c);
+        if (c.bad) { ret 0; }
+        if (shift < 64) {
+            value = value | ((b & 0x7F)::u64 << shift);
+        }
+        if ((b & 0x80) == 0) { ret value; }
+        shift = shift + 7;
+    }
+    c.bad = true;
+    ret 0;
+}
+
+# little-endian loads from raw memory, without bounds checks
+pub fun load_u32(p: *u8) u32 {
+    ret p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24);
+}
+
+pub fun store_u32(p: *u8, v: u32) {
+    p[0] = (v & 0xFF)::u8;
+    p[1] = ((v >> 8) & 0xFF)::u8;
+    p[2] = ((v >> 16) & 0xFF)::u8;
+    p[3] = ((v >> 24) & 0xFF)::u8;
+}
+
+test bytes__vint_forms {
+    # 0x7F in one byte, 0x80 in two, padding 0x80 bytes still decode
+    var b: [8]u8;
+    b[0] = 0x7F;
+    b[1] = 0x80;
+    b[2] = 0x01;
+    b[3] = 0x80;
+    b[4] = 0x80;
+    b[5] = 0x00;
+    var c: Cursor = cursor(?b[0], 6);
+    if (read_vint(?c) != 0x7F) { ret 1; }
+    if (read_vint(?c) != 0x80) { ret 2; }
+    if (read_vint(?c) != 0)    { ret 3; }
+    if (c.bad)                 { ret 4; }
+    # a vint cut off by the end of the buffer is bad
+    b[0] = 0xFF;
+    var d: Cursor = cursor(?b[0], 1);
+    read_vint(?d);
+    if (!d.bad) { ret 5; }
+    ret 0;
+}

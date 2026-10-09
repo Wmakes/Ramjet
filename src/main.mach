@@ -1,0 +1,147 @@
+# ramjet command line
+#
+#   ramjet l  [-p<pwd>] <archive>             list contents
+#   ramjet lt [-p<pwd>] <archive>             list with technical details
+#   ramjet t  [-p<pwd>] <archive>             test integrity
+#   ramjet x  [-p<pwd>] [-o+|-o-] <archive> [dest/]   extract with paths
+#   ramjet e  [-p<pwd>] [-o+|-o-] <archive> [dest/]   extract without paths
+#   ramjet p  [-p<pwd>] <archive> [name]      print file data to stdout
+
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use AR: ramjet.archive;
+use E:  ramjet.errors;
+use X:  ramjet.extract;
+use L:  ramjet.list;
+use M:  ramjet.mem;
+use H:  ramjet.rar5.header;
+use T:  ramjet.timefmt;
+
+fun usage() i64 {
+    print.eprintln("Ramjet 0.1.0 - clean-room RAR reader");
+    print.eprintln("usage: ramjet <command> [switches] <archive> [args]");
+    print.eprintln("commands:");
+    print.eprintln("  l    list archive contents");
+    print.eprintln("  lt   list with technical details");
+    print.eprintln("  t    test archive files");
+    print.eprintln("  x    extract files with full paths");
+    print.eprintln("  e    extract files without paths");
+    print.eprintln("  p    print file data to stdout");
+    print.eprintln("switches:");
+    print.eprintln("  -p<password>  set password");
+    print.eprintln("  -o+ / -o-     overwrite / skip existing files");
+    print.eprintln("  -ver          also extract older file versions as name;N");
+    ret 2;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc < 3) { ret usage(); }
+    if (!M.init()) {
+        print.eprintln("ramjet: cannot set up memory");
+        ret 1;
+    }
+
+    val cmd:        *u8  = argv[1];
+    var password:   *u8  = nil;
+    var archive:    *u8  = nil;
+    var rest_first: i64  = argc;
+    var overwrite:  u8   = 0;
+    var versions:   bool = false;
+
+    var i: i64 = 2;
+    for (i < argc) {
+        val a: *u8 = argv[i];
+        if (archive == nil && a[0] == '-' && a[1] == 'p') {
+            password = ?a[2];
+        }
+        or (archive == nil && a[0] == '-' && a[1] == 'o' && a[2] == '+') {
+            overwrite = 1;
+        }
+        or (archive == nil && a[0] == '-' && a[1] == 'o' && a[2] == '-') {
+            overwrite = 2;
+        }
+        or (archive == nil && M.cstr_eq(a, "-ver"::*u8)) {
+            versions = true;
+        }
+        or (archive == nil && a[0] == '-' && a[1] == '-' && a[2] == 0) {
+            # end of switches
+        }
+        or (archive == nil) {
+            archive    = a;
+            rest_first = i + 1;
+        }
+        or {
+            brk;
+        }
+        i = i + 1;
+    }
+    if (archive == nil) { ret usage(); }
+
+    var ar: AR.Archive;
+    val rc: E.Code = AR.open(?ar, archive, password);
+    if (rc != E.OK) {
+        print.eprintf("ramjet: {}: {}\n", archive::str, E.message(rc));
+        ret 1;
+    }
+
+    var status: i64 = 0;
+    if (M.cstr_eq(cmd, "l"::*u8) || M.cstr_eq(cmd, "lt"::*u8)) { X.load_comment(?ar); }
+    if (M.cstr_eq(cmd, "l"::*u8)) {
+        status = L.list(?ar, archive, false);
+    }
+    or (M.cstr_eq(cmd, "lt"::*u8)) {
+        status = L.list(?ar, archive, true);
+    }
+    or {
+        var opt: X.Options;
+        opt.dest      = nil;
+        opt.overwrite = X.OVERWRITE_SKIP;
+        if (overwrite == 1) { opt.overwrite = X.OVERWRITE_ALL; }
+        opt.names    = nil;
+        opt.nnames   = 0;
+        opt.quiet    = false;
+        opt.versions = versions;
+        var rest: i64 = rest_first;
+        if (M.cstr_eq(cmd, "t"::*u8)) {
+            opt.mode = X.MODE_TEST;
+        }
+        or (M.cstr_eq(cmd, "x"::*u8) || M.cstr_eq(cmd, "e"::*u8)) {
+            opt.mode = X.MODE_EXTRACT;
+            if (cmd[0] == 'e') { opt.mode = X.MODE_FLAT; }
+            # a last argument ending in '/' is the destination
+            if (argc > rest) {
+                val last: *u8   = argv[argc - 1];
+                val n:    usize = M.cstr_len(last);
+                if (n > 0 && last[n - 1] == '/') {
+                    opt.dest = last;
+                    argc     = argc - 1;
+                }
+                or (argc - rest == 1 && n > 0) {
+                    opt.dest = last;
+                    argc     = argc - 1;
+                }
+            }
+        }
+        or (M.cstr_eq(cmd, "p"::*u8)) {
+            opt.mode = X.MODE_PRINT;
+        }
+        or {
+            AR.close(?ar);
+            ret usage();
+        }
+        if (argc > rest) {
+            opt.names  = ?argv[rest];
+            opt.nnames = (argc - rest)::usize;
+        }
+        status = X.run(?ar, ?opt);
+    }
+    AR.close(?ar);
+    ret status;
+}

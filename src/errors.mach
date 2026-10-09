@@ -1,0 +1,55 @@
+# error codes shared by every layer
+#
+# functions return a Code; OK is zero. message() gives the text the command
+# line prints.
+
+use std.types.string.str;
+
+pub def Code: u32;
+
+pub val OK:             Code = 0;
+pub val NO_MEMORY:      Code = 1;
+pub val OPEN:           Code = 2;
+pub val READ:           Code = 3;
+pub val NOT_RAR:        Code = 4;
+pub val RAR4:           Code = 5;
+pub val BAD_HEADER:     Code = 6;
+pub val HEADER_CRC:     Code = 7;
+pub val TRUNCATED:      Code = 8;
+pub val NEED_PASSWORD:  Code = 9;
+pub val BAD_PASSWORD:   Code = 10;
+pub val UNSUPPORTED:    Code = 11;
+pub val BAD_DATA:       Code = 12;
+pub val DATA_CRC:       Code = 13;
+pub val MISSING_VOLUME: Code = 14;
+pub val WRITE:          Code = 15;
+pub val CREATE:         Code = 16;
+pub val UNSAFE_PATH:    Code = 17;
+pub val DICT_TOO_LARGE: Code = 18;
+pub val SOLID_BROKEN:   Code = 19;
+pub val USAGE:          Code = 20;
+
+pub fun message(c: Code) str {
+    if (c == OK)             { ret "ok"; }
+    if (c == NO_MEMORY)      { ret "out of memory"; }
+    if (c == OPEN)           { ret "cannot open file"; }
+    if (c == READ)           { ret "read error"; }
+    if (c == NOT_RAR)        { ret "not a RAR archive"; }
+    if (c == RAR4)           { ret "RAR 1.5-2.x compression is not supported"; }
+    if (c == BAD_HEADER)     { ret "malformed archive header"; }
+    if (c == HEADER_CRC)     { ret "header checksum mismatch, archive is damaged"; }
+    if (c == TRUNCATED)      { ret "archive is truncated"; }
+    if (c == NEED_PASSWORD)  { ret "archive is encrypted, a password is required (-p)"; }
+    if (c == BAD_PASSWORD)   { ret "wrong password"; }
+    if (c == UNSUPPORTED)    { ret "unsupported feature"; }
+    if (c == BAD_DATA)       { ret "compressed data is corrupt"; }
+    if (c == DATA_CRC)       { ret "checksum mismatch"; }
+    if (c == MISSING_VOLUME) { ret "next volume is missing"; }
+    if (c == WRITE)          { ret "write error"; }
+    if (c == CREATE)         { ret "cannot create output file"; }
+    if (c == UNSAFE_PATH)    { ret "unsafe path refused"; }
+    if (c == DICT_TOO_LARGE) { ret "dictionary size is too large"; }
+    if (c == SOLID_BROKEN)   { ret "previous solid file failed, cannot continue"; }
+    if (c == USAGE)          { ret "bad command line"; }
+    ret "unknown error";
+}

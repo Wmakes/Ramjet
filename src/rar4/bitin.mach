@@ -1,0 +1,118 @@
+# buffered MSB-first bit input over an entry's packed data
+#
+# RAR 2.9 data is one continuous stream per file. the LZ decoder reads bits;
+# the PPMd range decoder reads whole bytes from the same position, so both go
+# through this reader. reads past the end of the data return zero bits and
+# set `overrun`.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use M: ramjet.mem;
+use S: ramjet.stream;
+
+val CAP: usize = 0x10000;
+val PAD: usize = 16;
+
+pub rec BitIn {
+    src:     *S.Packed;
+    buf:     *u8;
+    len:     usize;
+    bitpos:  u64;
+    eof:     bool;
+    overrun: bool;
+}
+
+pub fun init(b: *BitIn, src: *S.Packed) bool {
+    if (b.buf == nil) {
+        b.buf = M.alloc(CAP + PAD);
+        if (b.buf == nil) { ret false; }
+    }
+    b.src     = src;
+    b.len     = 0;
+    b.bitpos  = 0;
+    b.eof     = false;
+    b.overrun = false;
+    ret true;
+}
+
+pub fun dnit(b: *BitIn) {
+    if (b.buf != nil) { M.free(b.buf, CAP + PAD); }
+    b.buf = nil;
+}
+
+# keep at least 8 readable bytes ahead of the read position; past the end
+# of the data the buffer holds zeros
+#[inline]
+fun ensure(b: *BitIn) {
+    var byte: usize = (b.bitpos >> 3)::usize;
+    if (byte + 8 <= b.len) { ret; }
+    if (!b.eof) {
+        # slide the unread bytes to the front and refill
+        if (byte > b.len) { byte = b.len; }
+        val keep: usize = b.len - byte;
+        M.move(b.buf, ?b.buf[byte], keep);
+        b.len    = keep;
+        b.bitpos = b.bitpos - (byte::u64 << 3);
+        for (b.len < CAP && !b.eof) {
+            val got: usize = S.packed_read(b.src, ?b.buf[b.len], CAP - b.len);
+            if (got == 0) { b.eof = true; }
+            b.len = b.len + got;
+        }
+        var i: usize = b.len;
+        for (i < CAP + PAD) {
+            b.buf[i] = 0;
+            i        = i + 1;
+        }
+        byte = (b.bitpos >> 3)::usize;
+    }
+    if (byte > b.len) {
+        # reading padding: the data ran out; stay inside the zero tail
+        b.overrun = true;
+        b.bitpos  = (b.len::u64 << 3) | (b.bitpos & 7);
+    }
+}
+
+# the next 16 bits, left aligned in the low 16 bits of the result
+#[inline]
+pub fun peek16(b: *BitIn) u32 {
+    ensure(b);
+    val p: *u8 = ?b.buf[(b.bitpos >> 3)::usize];
+    val v: u32 = (p[0]::u32 << 16) | (p[1]::u32 << 8) | p[2]::u32;
+    ret (v >> (8 - (b.bitpos & 7))::u32) & 0xFFFF;
+}
+
+#[inline]
+pub fun skip(b: *BitIn, n: u32) {
+    b.bitpos = b.bitpos + n::u64;
+}
+
+# n bits (1-16)
+#[inline]
+pub fun bits(b: *BitIn, n: u32) u32 {
+    val v: u32 = peek16(b) >> (16 - n);
+    skip(b, n);
+    ret v;
+}
+
+# move to the next byte boundary
+pub fun align(b: *BitIn) {
+    b.bitpos = (b.bitpos + 7) & (0 - 8)::u64;
+}
+
+# one whole byte at a byte boundary (for the range decoder)
+#[inline]
+pub fun byte(b: *BitIn) u8 {
+    ensure(b);
+    val v: u8 = b.buf[(b.bitpos >> 3)::usize];
+    b.bitpos = b.bitpos + 8;
+    ret v;
+}
+
+# no real input left at the read position
+pub fun exhausted(b: *BitIn) bool {
+    ensure(b);
+    ret b.overrun || (b.eof && (b.bitpos >> 3)::usize >= b.len);
+}

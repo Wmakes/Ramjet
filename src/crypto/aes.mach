@@ -1,0 +1,329 @@
+# AES-256 and AES-128 block ciphers (FIPS-197) with CBC mode
+#
+# a plain byte-oriented implementation: the S-box and the GF(2^8) products
+# used by MixColumns are tabulated once on first use. it is not constant
+# time; Ramjet only decrypts the user's own archives with it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub val BLOCK: usize = 16;
+
+var sbox:         [256]u8;
+var isbox:        [256]u8;
+var mul2:         [256]u8;
+var mul3:         [256]u8;
+var mul9:         [256]u8;
+var mul11:        [256]u8;
+var mul13:        [256]u8;
+var mul14:        [256]u8;
+var tables_ready: bool = false;
+
+fun xtime(x: u8) u8 {
+    var r: u8 = x << 1;
+    if ((x & 0x80) != 0) { r = r ^ 0x1B; }
+    ret r;
+}
+
+fun gmul(a: u8, b: u8) u8 {
+    var x: u8 = a;
+    var y: u8 = b;
+    var r: u8 = 0;
+    for (y != 0) {
+        if ((y & 1) != 0) { r = r ^ x; }
+        x = xtime(x);
+        y = y >> 1;
+    }
+    ret r;
+}
+
+fun rotl8(x: u8, n: u8) u8 {
+    ret (x << n) | (x >> (8 - n));
+}
+
+# build the S-box from its definition: multiplicative inverse followed by the
+# affine transform, walking the field with generator 3
+fun build_tables() {
+    if (tables_ready) { ret; }
+    var p: u8 = 1;
+    var q: u8 = 1;
+    for {
+        # p walks 3^k, q walks its inverse 3^-k
+        p = p ^ xtime(p);
+        q = q ^ (q << 1);
+        q = q ^ (q << 2);
+        q = q ^ (q << 4);
+        if ((q & 0x80) != 0) { q = q ^ 0x09; }
+        val s: u8 = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4) ^ 0x63;
+        sbox[p::usize] = s;
+        if (p == 1) { brk; }
+    }
+    sbox[0] = 0x63;
+    var i: usize = 0;
+    for (i < 256) {
+        isbox[sbox[i]::usize] = i::u8;
+        val b: u8 = i::u8;
+        mul2[i]  = gmul(b, 2);
+        mul3[i]  = gmul(b, 3);
+        mul9[i]  = gmul(b, 9);
+        mul11[i] = gmul(b, 11);
+        mul13[i] = gmul(b, 13);
+        mul14[i] = gmul(b, 14);
+        i        = i + 1;
+    }
+    tables_ready = true;
+}
+
+# expanded key: rounds + 1 round keys of 16 bytes (14 rounds for AES-256,
+# 10 for AES-128)
+pub rec Key {
+    rk:     [240]u8;
+    rounds: usize;
+}
+
+# AES-128 key schedule (Nk = 4)
+pub fun init128(k: *Key, key: *u8) {
+    build_tables();
+    k.rounds = 10;
+    var i: usize = 0;
+    for (i < 16) {
+        k.rk[i] = key[i];
+        i       = i + 1;
+    }
+    var rcon: u8 = 1;
+    i = 16;
+    for (i < 176) {
+        var t0: u8 = k.rk[i - 4];
+        var t1: u8 = k.rk[i - 3];
+        var t2: u8 = k.rk[i - 2];
+        var t3: u8 = k.rk[i - 1];
+        if (i % 16 == 0) {
+            val r: u8 = t0;
+            t0   = sbox[t1::usize] ^ rcon;
+            t1   = sbox[t2::usize];
+            t2   = sbox[t3::usize];
+            t3   = sbox[r::usize];
+            rcon = xtime(rcon);
+        }
+        k.rk[i]     = k.rk[i - 16] ^ t0;
+        k.rk[i + 1] = k.rk[i - 15] ^ t1;
+        k.rk[i + 2] = k.rk[i - 14] ^ t2;
+        k.rk[i + 3] = k.rk[i - 13] ^ t3;
+        i           = i + 4;
+    }
+}
+
+# AES-256 key schedule (Nk = 8)
+pub fun init(k: *Key, key: *u8) {
+    build_tables();
+    k.rounds = 14;
+    var i: usize = 0;
+    for (i < 32) {
+        k.rk[i] = key[i];
+        i       = i + 1;
+    }
+    var rcon: u8 = 1;
+    i = 32;
+    for (i < 240) {
+        var t0: u8 = k.rk[i - 4];
+        var t1: u8 = k.rk[i - 3];
+        var t2: u8 = k.rk[i - 2];
+        var t3: u8 = k.rk[i - 1];
+        if (i % 32 == 0) {
+            val r: u8 = t0;
+            t0   = sbox[t1::usize] ^ rcon;
+            t1   = sbox[t2::usize];
+            t2   = sbox[t3::usize];
+            t3   = sbox[r::usize];
+            rcon = xtime(rcon);
+        }
+        or (i % 32 == 16) {
+            t0 = sbox[t0::usize];
+            t1 = sbox[t1::usize];
+            t2 = sbox[t2::usize];
+            t3 = sbox[t3::usize];
+        }
+        k.rk[i]     = k.rk[i - 32] ^ t0;
+        k.rk[i + 1] = k.rk[i - 31] ^ t1;
+        k.rk[i + 2] = k.rk[i - 30] ^ t2;
+        k.rk[i + 3] = k.rk[i - 29] ^ t3;
+        i           = i + 4;
+    }
+}
+
+fun add_round_key(s: *u8, k: *Key, round: usize) {
+    var i: usize = 0;
+    for (i < 16) {
+        s[i] = s[i] ^ k.rk[round * 16 + i];
+        i    = i + 1;
+    }
+}
+
+# encrypt one 16-byte block in place
+pub fun encrypt_block(k: *Key, s: *u8) {
+    var t: [16]u8;
+    add_round_key(s, k, 0);
+    var round: usize = 1;
+    for (round <= k.rounds) {
+        # SubBytes and ShiftRows together: column c row r takes column c+r
+        var c: usize = 0;
+        for (c < 4) {
+            var r: usize = 0;
+            for (r < 4) {
+                t[c * 4 + r] = sbox[s[((c + r) % 4) * 4 + r]::usize];
+                r            = r + 1;
+            }
+            c = c + 1;
+        }
+        if (round != k.rounds) {
+            c = 0;
+            for (c < 4) {
+                val a0: u8 = t[c * 4];
+                val a1: u8 = t[c * 4 + 1];
+                val a2: u8 = t[c * 4 + 2];
+                val a3: u8 = t[c * 4 + 3];
+                s[c * 4]     = mul2[a0::usize] ^ mul3[a1::usize] ^ a2 ^ a3;
+                s[c * 4 + 1] = a0 ^ mul2[a1::usize] ^ mul3[a2::usize] ^ a3;
+                s[c * 4 + 2] = a0 ^ a1 ^ mul2[a2::usize] ^ mul3[a3::usize];
+                s[c * 4 + 3] = mul3[a0::usize] ^ a1 ^ a2 ^ mul2[a3::usize];
+                c            = c + 1;
+            }
+        }
+        or {
+            c = 0;
+            for (c < 16) {
+                s[c] = t[c];
+                c    = c + 1;
+            }
+        }
+        add_round_key(s, k, round);
+        round = round + 1;
+    }
+}
+
+# decrypt one 16-byte block in place
+pub fun decrypt_block(k: *Key, s: *u8) {
+    var t: [16]u8;
+    add_round_key(s, k, k.rounds);
+    var round: usize = k.rounds - 1;
+    for {
+        # inverse ShiftRows and SubBytes: column c row r came from column c-r
+        var c: usize = 0;
+        for (c < 4) {
+            var r: usize = 0;
+            for (r < 4) {
+                t[((c + r) % 4) * 4 + r] = isbox[s[c * 4 + r]::usize];
+                r                        = r + 1;
+            }
+            c = c + 1;
+        }
+        c = 0;
+        for (c < 16) {
+            s[c] = t[c] ^ k.rk[round * 16 + c];
+            c    = c + 1;
+        }
+        if (round == 0) { brk; }
+        c = 0;
+        for (c < 4) {
+            val a0: u8 = s[c * 4];
+            val a1: u8 = s[c * 4 + 1];
+            val a2: u8 = s[c * 4 + 2];
+            val a3: u8 = s[c * 4 + 3];
+            s[c * 4]     = mul14[a0::usize] ^ mul11[a1::usize] ^ mul13[a2::usize] ^ mul9[a3::usize];
+            s[c * 4 + 1] = mul9[a0::usize] ^ mul14[a1::usize] ^ mul11[a2::usize] ^ mul13[a3::usize];
+            s[c * 4 + 2] = mul13[a0::usize] ^ mul9[a1::usize] ^ mul14[a2::usize] ^ mul11[a3::usize];
+            s[c * 4 + 3] = mul11[a0::usize] ^ mul13[a1::usize] ^ mul9[a2::usize] ^ mul14[a3::usize];
+            c            = c + 1;
+        }
+        round = round - 1;
+    }
+}
+
+# CBC decryption of n bytes (a multiple of 16) in place; iv is updated to the
+# last ciphertext block so a stream can be decrypted in pieces
+pub fun cbc_decrypt(k: *Key, iv: *u8, data: *u8, n: usize) {
+    var prev: [16]u8;
+    var off:  usize = 0;
+    for (off + 16 <= n) {
+        var i: usize = 0;
+        for (i < 16) {
+            prev[i] = data[off + i];
+            i       = i + 1;
+        }
+        decrypt_block(k, ?data[off]);
+        i = 0;
+        for (i < 16) {
+            data[off + i] = data[off + i] ^ iv[i];
+            iv[i]         = prev[i];
+            i             = i + 1;
+        }
+        off = off + 16;
+    }
+}
+
+# CBC encryption of n bytes (a multiple of 16) in place
+pub fun cbc_encrypt(k: *Key, iv: *u8, data: *u8, n: usize) {
+    var off: usize = 0;
+    for (off + 16 <= n) {
+        var i: usize = 0;
+        for (i < 16) {
+            data[off + i] = data[off + i] ^ iv[i];
+            i             = i + 1;
+        }
+        encrypt_block(k, ?data[off]);
+        i = 0;
+        for (i < 16) {
+            iv[i] = data[off + i];
+            i     = i + 1;
+        }
+        off = off + 16;
+    }
+}
+
+test aes__fips197_c1 {
+    # FIPS-197 appendix C.1, AES-128: 69c4e0d86a7b0430d8cdb78070b4c55a
+    var key: [16]u8;
+    var blk: [16]u8;
+    var i:   usize = 0;
+    for (i < 16) {
+        key[i] = i::u8;
+        blk[i] = (i * 0x11)::u8;
+        i      = i + 1;
+    }
+    var k: Key;
+    init128(?k, ?key[0]);
+    encrypt_block(?k, ?blk[0]);
+    if (blk[0] != 0x69 || blk[1] != 0xC4 || blk[15] != 0x5A) { ret 1; }
+    decrypt_block(?k, ?blk[0]);
+    if (blk[5] != 0x55) { ret 2; }
+    ret 0;
+}
+
+test aes__fips197_c3 {
+    # FIPS-197 appendix C.3, AES-256
+    var key: [32]u8;
+    var blk: [16]u8;
+    var i:   usize = 0;
+    for (i < 32) {
+        key[i] = i::u8;
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        blk[i] = (i * 0x11)::u8;
+        i      = i + 1;
+    }
+    var k: Key;
+    init(?k, ?key[0]);
+    encrypt_block(?k, ?blk[0]);
+    if (blk[0] != 0x8E || blk[1] != 0xA2 || blk[7] != 0xBF || blk[15] != 0x89) { ret 1; }
+    decrypt_block(?k, ?blk[0]);
+    i = 0;
+    for (i < 16) {
+        if (blk[i] != (i * 0x11)::u8) { ret 2; }
+        i = i + 1;
+    }
+    ret 0;
+}

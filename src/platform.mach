@@ -1,0 +1,181 @@
+# filesystem calls std does not cover: file times, hard links, attributes
+#
+# Linux uses raw syscalls, Windows the kernel32 API. other systems report -1
+# and extraction falls back: hard links become copies, times stay at
+# extraction time.
+
+use std.types.size.isize;
+use std.types.size.usize;
+
+use M: ramjet.mem;
+
+$if ($mach.build.os == $mach.os.linux) {
+    use sys: std.system.os.linux.shared;
+}
+
+$if ($mach.build.os == $mach.os.linux && $mach.build.arch == $mach.arch.x86_64) {
+    val SYS_LINKAT:    usize = 265;
+    val SYS_FCHMODAT:  usize = 268;
+    val SYS_UTIMENSAT: usize = 280;
+}
+$or ($mach.build.os == $mach.os.linux) {
+    # aarch64 and riscv64 share the generic syscall table
+    val SYS_LINKAT:    usize = 37;
+    val SYS_FCHMODAT:  usize = 53;
+    val SYS_UTIMENSAT: usize = 88;
+}
+
+$if ($mach.build.os == $mach.os.windows) {
+    #[library("kernel32.dll")]
+    ext fun CreateFileW(path: *u16, access: u32, share: u32, security: ptr, disposition: u32, flags: u32, template: isize) isize;
+    #[library("kernel32.dll")]
+    ext fun SetFileTime(handle: isize, created: *u64, accessed: *u64, written: *u64) i32;
+    #[library("kernel32.dll")]
+    ext fun CloseHandle(handle: isize) i32;
+    #[library("kernel32.dll")]
+    ext fun CreateHardLinkW(path: *u16, existing: *u16, security: ptr) i32;
+    #[library("kernel32.dll")]
+    ext fun SetFileAttributesW(path: *u16, attributes: u32) i32;
+
+    val FILE_WRITE_ATTRIBUTES:      u32   = 0x100;
+    val FILE_SHARE_ALL:             u32   = 7;
+    val OPEN_EXISTING:              u32   = 3;
+    val FILE_FLAG_BACKUP_SEMANTICS: u32   = 0x02000000;
+    val FILE_FLAG_OPEN_REPARSE:     u32   = 0x00200000;
+    val INVALID_HANDLE:             isize = -1;
+}
+
+val AT_FDCWD:            i64   = -100;
+val AT_SYMLINK_NOFOLLOW: usize = 0x100;
+
+# kernel timespec
+rec Timespec {
+    sec:  i64;
+    nsec: i64;
+}
+
+# UTF-8 path to NUL-terminated UTF-16 with backslash separators; nil when out
+# of memory. the caller frees (n + 1) * 4 bytes.
+fun wide_path(path: *u8, n: usize) *u16 {
+    val out: *u16 = M.alloc((n + 1) * 4)::*u16;
+    if (out == nil) { ret nil; }
+    var i: usize = 0;
+    var o: usize = 0;
+    for (i < n) {
+        var cp:    u32   = path[i]::u32;
+        var extra: usize = 0;
+        if (cp >= 0xF0) {
+            cp    = cp & 0x07;
+            extra = 3;
+        }
+        or (cp >= 0xE0) {
+            cp    = cp & 0x0F;
+            extra = 2;
+        }
+        or (cp >= 0xC0) {
+            cp    = cp & 0x1F;
+            extra = 1;
+        }
+        i = i + 1;
+        var k: usize = 0;
+        for (k < extra && i < n) {
+            cp = (cp << 6) | (path[i] & 0x3F)::u32;
+            i  = i + 1;
+            k  = k + 1;
+        }
+        if (cp == '/') { cp = '\\'; }
+        if (cp >= 0x10000) {
+            val v: u32 = cp - 0x10000;
+            out[o]     = (0xD800 + (v >> 10))::u16;
+            out[o + 1] = (0xDC00 + (v & 0x3FF))::u16;
+            o          = o + 2;
+        }
+        or {
+            out[o] = cp::u16;
+            o      = o + 1;
+        }
+    }
+    out[o] = 0;
+    ret out;
+}
+
+# Unix seconds and nanoseconds to a Windows FILETIME
+fun filetime(sec: i64, nsec: u32) u64 {
+    ret ((sec + 11644473600) * 10000000)::u64 + (nsec / 100)::u64;
+}
+
+# set access and modification times of a path, not following a final
+# symbolic link; 0 on success
+pub fun set_times(path: *u8, atime_sec: i64, atime_nsec: u32, mtime_sec: i64, mtime_nsec: u32) i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        var ts: [2]Timespec;
+        ts[0] = Timespec{sec: atime_sec, nsec: atime_nsec::i64};
+        ts[1] = Timespec{sec: mtime_sec, nsec: mtime_nsec::i64};
+        ret sys.syscall4(SYS_UTIMENSAT, AT_FDCWD::usize, path::usize, (?ts[0])::usize, AT_SYMLINK_NOFOLLOW);
+    }
+    $or ($mach.build.os == $mach.os.windows) {
+        val n: usize = M.cstr_len(path);
+        val w: *u16  = wide_path(path, n);
+        if (w == nil) { ret -1; }
+        val h: isize = CreateFileW(w, FILE_WRITE_ATTRIBUTES, FILE_SHARE_ALL, nil, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE, 0);
+        M.free(w::*u8, (n + 1) * 4);
+        if (h == INVALID_HANDLE) { ret -1; }
+        var at: u64 = filetime(atime_sec, atime_nsec);
+        var mt: u64 = filetime(mtime_sec, mtime_nsec);
+        val ok: i32 = SetFileTime(h, nil, ?at, ?mt);
+        CloseHandle(h);
+        if (ok == 0) { ret -1; }
+        ret 0;
+    }
+    $or {
+        ret -1;
+    }
+}
+
+# create a hard link `link` to the existing `target`; 0 on success
+pub fun hard_link(target: *u8, link: *u8) i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        ret sys.syscall5(SYS_LINKAT, AT_FDCWD::usize, target::usize, AT_FDCWD::usize, link::usize, 0);
+    }
+    $or ($mach.build.os == $mach.os.windows) {
+        val tn: usize = M.cstr_len(target);
+        val ln: usize = M.cstr_len(link);
+        val wt: *u16  = wide_path(target, tn);
+        val wl: *u16  = wide_path(link, ln);
+        var r:  i64   = -1;
+        if (wt != nil && wl != nil && CreateHardLinkW(wl, wt, nil) != 0) { r = 0; }
+        if (wt != nil)                                                   { M.free(wt::*u8, (tn + 1) * 4); }
+        if (wl != nil)                                                   { M.free(wl::*u8, (ln + 1) * 4); }
+        ret r;
+    }
+    $or {
+        ret -1;
+    }
+}
+
+# set the Unix permission bits of a path; 0 on success
+pub fun set_mode(path: *u8, mode: i32) i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        ret sys.syscall3(SYS_FCHMODAT, AT_FDCWD::usize, path::usize, mode::usize);
+    }
+    $or {
+        ret -1;
+    }
+}
+
+# apply Windows attributes (read-only, hidden, system, archive); 0 on success
+pub fun set_attributes(path: *u8, attr: u32) i64 {
+    $if ($mach.build.os == $mach.os.windows) {
+        val n: usize = M.cstr_len(path);
+        val w: *u16  = wide_path(path, n);
+        if (w == nil) { ret -1; }
+        val ok: i32 = SetFileAttributesW(w, attr & 0x27);
+        M.free(w::*u8, (n + 1) * 4);
+        if (ok == 0) { ret -1; }
+        ret 0;
+    }
+    $or {
+        ret -1;
+    }
+}

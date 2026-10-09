@@ -1,0 +1,475 @@
+# RAR 5.0 block headers
+#
+# layout follows the RARLAB technote (docs/rar5-technote.html). every parser
+# here works on a plaintext copy of one header: the archive layer locates the
+# header, decrypts it when headers are encrypted, and hands the bytes over.
+
+use ramjet.crypto.crc32;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use B: ramjet.bytes;
+
+pub val SIGNATURE_LEN: usize = 8;
+
+# header types
+pub val HEAD_MAIN:    u64 = 1;
+pub val HEAD_FILE:    u64 = 2;
+pub val HEAD_SERVICE: u64 = 3;
+pub val HEAD_CRYPT:   u64 = 4;
+pub val HEAD_END:     u64 = 5;
+
+# flags common to every header
+pub val HFL_EXTRA:        u64 = 0x0001;
+pub val HFL_DATA:         u64 = 0x0002;
+pub val HFL_SKIP_UNKNOWN: u64 = 0x0004;
+pub val HFL_SPLIT_BEFORE: u64 = 0x0008;
+pub val HFL_SPLIT_AFTER:  u64 = 0x0010;
+pub val HFL_CHILD:        u64 = 0x0020;
+pub val HFL_INHERITED:    u64 = 0x0040;
+
+# main archive flags
+pub val MHFL_VOLUME:    u64 = 0x0001;
+pub val MHFL_VOLNUMBER: u64 = 0x0002;
+pub val MHFL_SOLID:     u64 = 0x0004;
+pub val MHFL_PROTECT:   u64 = 0x0008;
+pub val MHFL_LOCK:      u64 = 0x0010;
+
+# file header flags
+pub val FHFL_DIRECTORY:  u64 = 0x0001;
+pub val FHFL_UTIME:      u64 = 0x0002;
+pub val FHFL_CRC32:      u64 = 0x0004;
+pub val FHFL_UNPUNKNOWN: u64 = 0x0008;
+
+# end of archive flags
+pub val EHFL_NEXTVOLUME: u64 = 0x0001;
+
+# extra record types in file and service headers
+pub val FHEXTRA_CRYPT:   u64 = 0x01;
+pub val FHEXTRA_HASH:    u64 = 0x02;
+pub val FHEXTRA_HTIME:   u64 = 0x03;
+pub val FHEXTRA_VERSION: u64 = 0x04;
+pub val FHEXTRA_REDIR:   u64 = 0x05;
+pub val FHEXTRA_UOWNER:  u64 = 0x06;
+pub val FHEXTRA_SUBDATA: u64 = 0x07;
+
+# extra record types in the main header
+pub val MHEXTRA_LOCATOR:  u64 = 0x01;
+pub val MHEXTRA_METADATA: u64 = 0x02;
+
+# host operating systems
+pub val HOST_WINDOWS: u64 = 0;
+pub val HOST_UNIX:    u64 = 1;
+
+# redirection types
+pub val REDIR_NONE:         u64 = 0;
+pub val REDIR_UNIX_SYMLINK: u64 = 1;
+pub val REDIR_WIN_SYMLINK:  u64 = 2;
+pub val REDIR_JUNCTION:     u64 = 3;
+pub val REDIR_HARDLINK:     u64 = 4;
+pub val REDIR_FILECOPY:     u64 = 5;
+
+pub val HASH_BLAKE2SP: u64 = 0;
+
+# the parts of a block every header type shares
+# ---
+# crc:        stored header CRC32
+# crc_ok:     the stored CRC matches the header bytes
+# head_size:  value of the header size field
+# total:      bytes from the CRC field to the end of the header
+# htype:      header type
+# hflags:     common header flags
+# extra_size: bytes of extra area at the end of the header
+# data_size:  bytes of data area following the header
+# body:       cursor over the type-specific fields, extra area excluded
+# extra:      cursor over the extra area
+pub rec Block {
+    crc:        u32;
+    crc_ok:     bool;
+    head_size:  u64;
+    total:      usize;
+    htype:      u64;
+    hflags:     u64;
+    extra_size: u64;
+    data_size:  u64;
+    body:       B.Cursor;
+    extra:      B.Cursor;
+}
+
+# bytes the CRC and size fields of a header occupy, plus the header size, read
+# from the first bytes of a header; 0 if those bytes are not a valid prefix
+pub fun peek_total(p: *u8, avail: usize) usize {
+    if (avail < 5) { ret 0; }
+    var c: B.Cursor = B.cursor(p, avail);
+    B.read_u32(?c);
+    val start: usize = c.pos;
+    val size:  u64   = B.read_vint(?c);
+    if (c.bad || c.pos - start > 3 || size == 0 || size > 0x200000) { ret 0; }
+    ret c.pos + size::usize;
+}
+
+# parse the common fields of one header
+# ---
+# p:     first byte of the header (its CRC field)
+# avail: bytes readable at p
+# out:   filled in when the result is true
+# ret:   true when the header is complete and well formed (CRC is reported,
+#        not enforced)
+pub fun parse_block(p: *u8, avail: usize, out: *Block) bool {
+    val total: usize = peek_total(p, avail);
+    if (total == 0 || total > avail) { ret false; }
+
+    var c: B.Cursor = B.cursor(p, total);
+    out.crc       = B.read_u32(?c);
+    out.crc_ok    = crc32.hash(?p[4], total - 4) == out.crc;
+    out.head_size = B.read_vint(?c);
+    out.total     = total;
+
+    out.htype      = B.read_vint(?c);
+    out.hflags     = B.read_vint(?c);
+    out.extra_size = 0;
+    out.data_size  = 0;
+    if ((out.hflags & HFL_EXTRA) != 0)                  { out.extra_size = B.read_vint(?c); }
+    if ((out.hflags & HFL_DATA) != 0)                   { out.data_size = B.read_vint(?c); }
+    if (c.bad || out.extra_size > B.remaining(?c)::u64) { ret false; }
+
+    val body_len: usize = B.remaining(?c) - out.extra_size::usize;
+    out.body  = B.cursor(B.here(?c), body_len);
+    out.extra = B.cursor(?p[c.pos + body_len], out.extra_size::usize);
+    ret true;
+}
+
+# ---------------------------------------------------------------- main header
+
+# locator and archive flags from the main header
+pub rec MainHeader {
+    flags:     u64;
+    volume:    u64;
+    qo_offset: u64;
+    rr_offset: u64;
+}
+
+pub fun parse_main(b: *Block, out: *MainHeader) bool {
+    out.flags     = B.read_vint(?b.body);
+    out.volume    = 0;
+    out.qo_offset = 0;
+    out.rr_offset = 0;
+    if ((out.flags & MHFL_VOLNUMBER) != 0) { out.volume = B.read_vint(?b.body); }
+    if (b.body.bad)                        { ret false; }
+
+    var x: B.Cursor = b.extra;
+    for (B.remaining(?x) > 0) {
+        val size: u64 = B.read_vint(?x);
+        if (x.bad || size == 0 || size > B.remaining(?x)::u64) { ret false; }
+        var r: B.Cursor = B.cursor(B.here(?x), size::usize);
+        B.skip(?x, size);
+        val kind: u64 = B.read_vint(?r);
+        if (kind == MHEXTRA_LOCATOR) {
+            val lflags: u64 = B.read_vint(?r);
+            if ((lflags & 1) != 0) { out.qo_offset = B.read_vint(?r); }
+            if ((lflags & 2) != 0) { out.rr_offset = B.read_vint(?r); }
+        }
+    }
+    ret true;
+}
+
+# ---------------------------------------------------------------- encryption
+
+# AES-256 parameters from an archive encryption header or a file encryption
+# record
+# ---
+# rar4:      RAR 2.9-4.x AES-128 with an 8-byte salt (salt[0..8])
+# version:   encryption algorithm version, 0 for AES-256
+# flags:     0x1 password check present, 0x2 tweaked checksums
+# kdf_count: binary logarithm of the PBKDF2 iteration count
+# salt:      PBKDF2 salt
+# iv:        AES-CBC initialization vector (file records only)
+# check:     8 bytes of password check and 4 of its checksum
+pub rec Crypt {
+    present:   bool;
+    rar4:      bool;
+    version:   u64;
+    flags:     u64;
+    kdf_count: u8;
+    salt:      [16]u8;
+    iv:        [16]u8;
+    check:     [12]u8;
+}
+
+pub val CRYPT_PSWCHECK: u64 = 0x0001;
+pub val CRYPT_HASHMAC:  u64 = 0x0002;
+
+# body of an archive encryption header (type 4)
+pub fun parse_crypt_head(b: *Block, out: *Crypt) bool {
+    out.present   = true;
+    out.rar4      = false;
+    out.version   = B.read_vint(?b.body);
+    out.flags     = B.read_vint(?b.body);
+    out.kdf_count = B.read_u8(?b.body);
+    B.read_into(?b.body, ?out.salt[0], 16);
+    if ((out.flags & CRYPT_PSWCHECK) != 0) { B.read_into(?b.body, ?out.check[0], 12); }
+    ret !b.body.bad;
+}
+
+# ---------------------------------------------------------------- file header
+
+# a time stamp as seconds and nanoseconds since 1970-01-01 UTC
+pub rec Time {
+    present: bool;
+    sec:     i64;
+    nsec:    u32;
+}
+
+# Windows FILETIME (100 ns ticks since 1601-01-01) to Unix time
+pub fun from_filetime(ft: u64) Time {
+    val ticks_per_sec: u64 = 10000000;
+    val sec:           i64 = (ft / ticks_per_sec)::i64 - 11644473600;
+    val nsec:          u32 = ((ft % ticks_per_sec) * 100)::u32;
+    ret Time{present: true, sec: sec, nsec: nsec};
+}
+
+# fields of a file or service header (types 2 and 3)
+# ---
+# rar4:    parsed from a RAR 1.5-4.x header
+# unp_ver: RAR 1.5-4.x version needed to extract (15, 20, 26, 29)
+# name, name_len: name bytes inside the header copy that was parsed
+# comp_version: compression algorithm version (bits 0-5)
+# solid:        continues the dictionary of the previous file
+# method:       compression method 0 (store) .. 5
+# dict_size:    minimum dictionary size in bytes
+# v1_as_v0:     version 1 dictionary field over version 0 compressed data
+pub rec FileHeader {
+    rar4:         bool;
+    unp_ver:      u8;
+    flags:        u64;
+    unp_size:     u64;
+    attr:         u64;
+    mtime:        Time;
+    ctime:        Time;
+    atime:        Time;
+    data_crc:     u32;
+    comp_info:    u64;
+    comp_version: u64;
+    solid:        bool;
+    method:       u64;
+    dict_size:    u64;
+    v1_as_v0:     bool;
+    host_os:      u64;
+    name:         *u8;
+    name_len:     usize;
+
+    crypt: Crypt;
+
+    has_blake2: bool;
+    blake2:     [32]u8;
+
+    file_version: u64;
+
+    redir_type:  u64;
+    redir_flags: u64;
+    redir_name:  *u8;
+    redir_len:   usize;
+
+    has_uid:    bool;
+    has_gid:    bool;
+    uid:        u64;
+    gid:        u64;
+    user_name:  *u8;
+    user_len:   usize;
+    group_name: *u8;
+    group_len:  usize;
+
+    subdata:     *u8;
+    subdata_len: usize;
+}
+
+fun read_time(c: *B.Cursor, unix: bool) Time {
+    if (unix) {
+        ret Time{present: true, sec: B.read_u32(c)::i64, nsec: 0};
+    }
+    ret from_filetime(B.read_u64(c));
+}
+
+# dictionary size in bytes from the compression information field
+pub fun dict_size_of(comp_info: u64) u64 {
+    val version: u64 = comp_info & 0x3F;
+    val n:       u64 = (comp_info >> 10) & 0x1F;
+    var size:    u64 = 0x20000::u64 << n;
+    if (version == 1) {
+        val fraction: u64 = (comp_info >> 15) & 0x1F;
+        size = size + size / 32 * fraction;
+    }
+    ret size;
+}
+
+fun parse_file_extra(x: *B.Cursor, out: *FileHeader) bool {
+    for (B.remaining(x) > 0) {
+        val size: u64 = B.read_vint(x);
+        if (x.bad || size == 0 || size > B.remaining(x)::u64) { ret false; }
+        var r: B.Cursor = B.cursor(B.here(x), size::usize);
+        B.skip(x, size);
+        val kind: u64 = B.read_vint(?r);
+
+        if (kind == FHEXTRA_CRYPT) {
+            out.crypt.present   = true;
+            out.crypt.version   = B.read_vint(?r);
+            out.crypt.flags     = B.read_vint(?r);
+            out.crypt.kdf_count = B.read_u8(?r);
+            B.read_into(?r, ?out.crypt.salt[0], 16);
+            B.read_into(?r, ?out.crypt.iv[0], 16);
+            if ((out.crypt.flags & CRYPT_PSWCHECK) != 0) { B.read_into(?r, ?out.crypt.check[0], 12); }
+        }
+        or (kind == FHEXTRA_HASH) {
+            val htype: u64 = B.read_vint(?r);
+            if (htype == HASH_BLAKE2SP) {
+                out.has_blake2 = true;
+                B.read_into(?r, ?out.blake2[0], 32);
+            }
+        }
+        or (kind == FHEXTRA_HTIME) {
+            val tflags: u64  = B.read_vint(?r);
+            val unix:   bool = (tflags & 0x01) != 0;
+            if ((tflags & 0x02) != 0) { out.mtime = read_time(?r, unix); }
+            if ((tflags & 0x04) != 0) { out.ctime = read_time(?r, unix); }
+            if ((tflags & 0x08) != 0) { out.atime = read_time(?r, unix); }
+            if (unix && (tflags & 0x10) != 0) {
+                if ((tflags & 0x02) != 0) { out.mtime.nsec = B.read_u32(?r) & 0x3FFFFFFF; }
+                if ((tflags & 0x04) != 0) { out.ctime.nsec = B.read_u32(?r) & 0x3FFFFFFF; }
+                if ((tflags & 0x08) != 0) { out.atime.nsec = B.read_u32(?r) & 0x3FFFFFFF; }
+            }
+        }
+        or (kind == FHEXTRA_VERSION) {
+            B.read_vint(?r);
+            out.file_version = B.read_vint(?r);
+        }
+        or (kind == FHEXTRA_REDIR) {
+            out.redir_type  = B.read_vint(?r);
+            out.redir_flags = B.read_vint(?r);
+            val n: u64 = B.read_vint(?r);
+            if (n > B.remaining(?r)::u64) { ret false; }
+            out.redir_name = B.here(?r);
+            out.redir_len  = n::usize;
+            B.skip(?r, n);
+        }
+        or (kind == FHEXTRA_UOWNER) {
+            val oflags: u64 = B.read_vint(?r);
+            if ((oflags & 0x01) != 0) {
+                val n: u64 = B.read_vint(?r);
+                if (n > B.remaining(?r)::u64) { ret false; }
+                out.user_name = B.here(?r);
+                out.user_len  = n::usize;
+                B.skip(?r, n);
+            }
+            if ((oflags & 0x02) != 0) {
+                val n: u64 = B.read_vint(?r);
+                if (n > B.remaining(?r)::u64) { ret false; }
+                out.group_name = B.here(?r);
+                out.group_len  = n::usize;
+                B.skip(?r, n);
+            }
+            if ((oflags & 0x04) != 0) {
+                out.has_uid = true;
+                out.uid     = B.read_vint(?r);
+            }
+            if ((oflags & 0x08) != 0) {
+                out.has_gid = true;
+                out.gid     = B.read_vint(?r);
+            }
+        }
+        or (kind == FHEXTRA_SUBDATA) {
+            out.subdata     = B.here(?r);
+            out.subdata_len = B.remaining(?r);
+        }
+        # unknown record types are skipped, as the format requires
+        if (r.bad) { ret false; }
+    }
+    ret true;
+}
+
+# body and extra area of a file or service header
+pub fun parse_file(b: *Block, out: *FileHeader) bool {
+    var c: *B.Cursor = ?b.body;
+    out.flags         = B.read_vint(c);
+    out.unp_size      = B.read_vint(c);
+    out.attr          = B.read_vint(c);
+    out.mtime.present = false;
+    out.ctime.present = false;
+    out.atime.present = false;
+    if ((out.flags & FHFL_UTIME) != 0) {
+        out.mtime = Time{present: true, sec: B.read_u32(c)::i64, nsec: 0};
+    }
+    out.data_crc = 0;
+    if ((out.flags & FHFL_CRC32) != 0) { out.data_crc = B.read_u32(c); }
+    out.comp_info    = B.read_vint(c);
+    out.comp_version = out.comp_info & 0x3F;
+    out.solid        = (out.comp_info & 0x40) != 0;
+    out.method       = (out.comp_info >> 7) & 0x07;
+    out.dict_size    = dict_size_of(out.comp_info);
+    out.v1_as_v0     = out.comp_version == 1 && (out.comp_info & 0x100000) != 0;
+    out.host_os      = B.read_vint(c);
+    val n: u64 = B.read_vint(c);
+    if (c.bad || n > B.remaining(c)::u64) { ret false; }
+    out.name     = B.here(c);
+    out.name_len = n::usize;
+    B.skip(c, n);
+
+    out.crypt.present = false;
+    out.crypt.rar4    = false;
+    out.rar4          = false;
+    out.unp_ver       = 0;
+    out.has_blake2    = false;
+    out.file_version  = 0;
+    out.redir_type    = REDIR_NONE;
+    out.redir_flags   = 0;
+    out.redir_name    = nil;
+    out.redir_len     = 0;
+    out.has_uid       = false;
+    out.has_gid       = false;
+    out.uid           = 0;
+    out.gid           = 0;
+    out.user_name     = nil;
+    out.user_len      = 0;
+    out.group_name    = nil;
+    out.group_len     = 0;
+    out.subdata       = nil;
+    out.subdata_len   = 0;
+
+    if (c.bad) { ret false; }
+    var x: B.Cursor = b.extra;
+    ret parse_file_extra(?x, out);
+}
+
+# true when a header name equals the given service name
+pub fun name_is(h: *FileHeader, s: *u8, n: usize) bool {
+    if (h.name_len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (h.name[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# ---------------------------------------------------------------- end header
+
+pub fun parse_end(b: *Block) u64 {
+    ret B.read_vint(?b.body);
+}
+
+test header__dict_size {
+    # method bits zero, dictionary N=2 -> 512 KB
+    if (dict_size_of(0x0800) != 0x80000) { ret 1; }
+    # version 1, N=15 (4 GB), fraction 16/32 -> 6 GB
+    val info: u64 = 1 | (15::u64 << 10) | (16::u64 << 15);
+    if (dict_size_of(info) != 0x180000000) { ret 2; }
+    ret 0;
+}
+
+test header__filetime {
+    # 1970-01-01 is 116444736000000000 ticks after 1601
+    val t: Time = from_filetime(116444736000000000 + 15);
+    if (t.sec != 0 || t.nsec != 1500) { ret 1; }
+    ret 0;
+}

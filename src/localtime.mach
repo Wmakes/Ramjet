@@ -1,0 +1,362 @@
+# local time to UTC, for formats that store local wall-clock time
+#
+# reads the system zone from /etc/localtime: a TZif file (RFC 8536) with
+# explicit transitions and, in version 2+, a POSIX TZ rule in the footer for
+# times after the last transition. without a zone file, local time is UTC.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use V: std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+
+use M: ramjet.mem;
+use T: ramjet.timefmt;
+
+val MAX_TRANS: usize = 2048;
+val MAX_TYPES: usize = 64;
+
+# a POSIX TZ rule date: Mm.w.d (month, week 1-5, weekday) or Jn / n
+rec RuleDate {
+    kind:  u8;
+    month: i64;
+    week:  i64;
+    wday:  i64;
+    day:   i64;
+    time:  i64;
+}
+
+rec Zone {
+    loaded: bool;
+    ntrans: usize;
+    trans:  [2048]i64;
+    idx:    [2048]u8;
+    ntypes: usize;
+    offs:   [64]i64;
+
+    has_rule: bool;
+    std_off:  i64;
+    dst_off:  i64;
+    has_dst:  bool;
+    start:    RuleDate;
+    end:      RuleDate;
+}
+
+var zone:       Zone;
+var zone_tried: bool = false;
+
+fun be32(p: *u8) i64 {
+    val v: u32 = (p[0]::u32 << 24) | (p[1]::u32 << 16) | (p[2]::u32 << 8) | p[3]::u32;
+    ret v::i32::i64;
+}
+
+fun be64(p: *u8) i64 {
+    val hi: u64 = be32(p)::u32::u64;
+    val lo: u64 = be32(?p[4])::u32::u64;
+    ret ((hi << 32) | lo)::i64;
+}
+
+# ---------------------------------------------------------------- POSIX rule
+
+rec Parser {
+    s:   *u8;
+    n:   usize;
+    pos: usize;
+    bad: bool;
+}
+
+fun peekc(p: *Parser) u8 {
+    if (p.pos >= p.n) { ret 0; }
+    ret p.s[p.pos];
+}
+
+fun number(p: *Parser) i64 {
+    var v:   i64  = 0;
+    var any: bool = false;
+    for (peekc(p) >= '0' && peekc(p) <= '9') {
+        v     = v * 10 + (peekc(p) - '0')::i64;
+        p.pos = p.pos + 1;
+        any   = true;
+    }
+    if (!any) { p.bad = true; }
+    ret v;
+}
+
+# zone name: letters, or anything inside <...>
+fun skip_name(p: *Parser) {
+    if (peekc(p) == '<') {
+        for (p.pos < p.n && peekc(p) != '>') { p.pos = p.pos + 1; }
+        p.pos = p.pos + 1;
+        ret;
+    }
+    var any: bool = false;
+    for ((peekc(p) >= 'A' && peekc(p) <= 'Z') || (peekc(p) >= 'a' && peekc(p) <= 'z')) {
+        p.pos = p.pos + 1;
+        any   = true;
+    }
+    if (!any) { p.bad = true; }
+}
+
+# [+-]hh[:mm[:ss]] as seconds
+fun hms(p: *Parser) i64 {
+    var sign: i64 = 1;
+    if (peekc(p) == '+') { p.pos = p.pos + 1; }
+    or (peekc(p) == '-') {
+        sign  = -1;
+        p.pos = p.pos + 1;
+    }
+    var v: i64 = number(p) * 3600;
+    if (peekc(p) == ':') {
+        p.pos = p.pos + 1;
+        v     = v + number(p) * 60;
+        if (peekc(p) == ':') {
+            p.pos = p.pos + 1;
+            v     = v + number(p);
+        }
+    }
+    ret sign * v;
+}
+
+fun rule_date(p: *Parser, out: *RuleDate) {
+    if (peekc(p) == 'M') {
+        p.pos     = p.pos + 1;
+        out.kind  = 'M';
+        out.month = number(p);
+        if (peekc(p) != '.') { p.bad = true; }
+        p.pos    = p.pos + 1;
+        out.week = number(p);
+        if (peekc(p) != '.') { p.bad = true; }
+        p.pos    = p.pos + 1;
+        out.wday = number(p);
+    }
+    or (peekc(p) == 'J') {
+        p.pos    = p.pos + 1;
+        out.kind = 'J';
+        out.day  = number(p);
+    }
+    or {
+        out.kind = 'n';
+        out.day  = number(p);
+    }
+    out.time = 7200;
+    if (peekc(p) == '/') {
+        p.pos    = p.pos + 1;
+        out.time = hms(p);
+    }
+}
+
+fun parse_rule(z: *Zone, s: *u8, n: usize) {
+    var p: Parser = Parser{s: s, n: n, pos: 0, bad: false};
+    skip_name(?p);
+    # POSIX offsets are west-positive; store east-positive like TZif
+    z.std_off = 0 - hms(?p);
+    z.has_dst = false;
+    if (p.pos < n && peekc(?p) != ',') {
+        skip_name(?p);
+        z.dst_off = z.std_off + 3600;
+        if (p.pos < n && peekc(?p) != ',') { z.dst_off = 0 - hms(?p); }
+        z.has_dst = true;
+        if (peekc(?p) == ',') {
+            p.pos = p.pos + 1;
+            rule_date(?p, ?z.start);
+            if (peekc(?p) == ',') { p.pos = p.pos + 1; }
+            rule_date(?p, ?z.end);
+        }
+        or {
+            # the US default rule when none is given
+            z.start = RuleDate{kind: 'M', month: 3, week: 2, wday: 0, day: 0, time: 7200};
+            z.end   = RuleDate{kind: 'M', month: 11, week: 1, wday: 0, day: 0, time: 7200};
+        }
+    }
+    z.has_rule = !p.bad;
+}
+
+# days since 1970-01-01 of a calendar date
+fun days_from_civil(y0: i64, m: i64, d: i64) i64 {
+    var y: i64 = y0;
+    if (m <= 2) { y = y - 1; }
+    var era: i64 = y / 400;
+    if (y < 0 && y % 400 != 0) { era = era - 1; }
+    val yoe: i64 = y - era * 400;
+    var mp:  i64 = m + 9;
+    if (m > 2) { mp = m - 3; }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    ret era * 146097 + doe - 719468;
+}
+
+fun is_leap(y: i64) bool {
+    ret (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+# local seconds since the start of the year at which a rule date takes effect
+fun rule_instant(r: *RuleDate, year: i64) i64 {
+    var day: i64 = 0;
+    if (r.kind == 'M') {
+        val first: i64 = days_from_civil(year, r.month, 1);
+        # 1970-01-01 was a Thursday (weekday 4)
+        var wd: i64 = (first + 4) % 7;
+        if (wd < 0) { wd = wd + 7; }
+        var d:     i64 = 1 + (r.wday - wd + 7) % 7 + (r.week - 1) * 7;
+        var mdays: i64 = 31;
+        if (r.month == 4 || r.month == 6 || r.month == 9 || r.month == 11) { mdays = 30; }
+        if (r.month == 2) {
+            mdays = 28;
+            if (is_leap(year)) { mdays = 29; }
+        }
+        for (d > mdays) { d = d - 7; }
+        day = days_from_civil(year, r.month, d) - days_from_civil(year, 1, 1);
+    }
+    or (r.kind == 'J') {
+        day = r.day - 1;
+        if (is_leap(year) && r.day >= 60) { day = day + 1; }
+    }
+    or {
+        day = r.day;
+    }
+    ret day * 86400 + r.time;
+}
+
+# UTC offset the rule gives for a UTC instant
+fun rule_offset(z: *Zone, t: i64) i64 {
+    if (!z.has_dst) { ret z.std_off; }
+    val year: i64 = T.civil(t).year;
+    val y0:   i64 = days_from_civil(year, 1, 1) * 86400;
+    # transition instants in UTC: start is given in standard time, end in DST
+    val start: i64 = y0 + rule_instant(?z.start, year) - z.std_off;
+    val end:   i64 = y0 + rule_instant(?z.end, year) - z.dst_off;
+    if (start < end) {
+        if (t >= start && t < end) { ret z.dst_off; }
+        ret z.std_off;
+    }
+    # southern hemisphere: DST spans the new year
+    if (t >= end && t < start) { ret z.std_off; }
+    ret z.dst_off;
+}
+
+# ---------------------------------------------------------------- TZif
+
+fun load_tzif(z: *Zone, d: *u8, n: usize) bool {
+    if (n < 44 || d[0] != 'T' || d[1] != 'Z' || d[2] != 'i' || d[3] != 'f') { ret false; }
+    val version:   u8    = d[4];
+    var pos:       usize = 0;
+    var time_size: usize = 4;
+    # version 2+ repeats the data with 64-bit times after the v1 block
+    if (version >= '2') {
+        val isut:  usize = be32(?d[20])::usize;
+        val isstd: usize = be32(?d[24])::usize;
+        val leap:  usize = be32(?d[28])::usize;
+        val tc:    usize = be32(?d[32])::usize;
+        val ty:    usize = be32(?d[36])::usize;
+        val ch:    usize = be32(?d[40])::usize;
+        pos       = 44 + tc * 5 + ty * 6 + ch + leap * 8 + isstd + isut;
+        time_size = 8;
+        if (pos + 44 > n || d[pos] != 'T') { ret false; }
+    }
+    val isut:  usize = be32(?d[pos + 20])::usize;
+    val isstd: usize = be32(?d[pos + 24])::usize;
+    val leap:  usize = be32(?d[pos + 28])::usize;
+    val tc:    usize = be32(?d[pos + 32])::usize;
+    val ty:    usize = be32(?d[pos + 36])::usize;
+    val ch:    usize = be32(?d[pos + 40])::usize;
+    pos = pos + 44;
+    val body: usize = tc * (time_size + 1) + ty * 6 + ch + leap * (time_size + 4) + isstd + isut;
+    if (pos + body > n || tc > MAX_TRANS || ty > MAX_TYPES || ty == 0) { ret false; }
+
+    var i: usize = 0;
+    for (i < tc) {
+        if (time_size == 8) { z.trans[i] = be64(?d[pos + i * 8]); }
+        or                  { z.trans[i] = be32(?d[pos + i * 4]); }
+        i = i + 1;
+    }
+    pos = pos + tc * time_size;
+    i   = 0;
+    for (i < tc) {
+        z.idx[i] = d[pos + i];
+        if (z.idx[i]::usize >= ty) { ret false; }
+        i = i + 1;
+    }
+    pos = pos + tc;
+    i   = 0;
+    for (i < ty) {
+        z.offs[i] = be32(?d[pos + i * 6]);
+        i         = i + 1;
+    }
+    pos      = pos + ty * 6 + ch + leap * (time_size + 4) + isstd + isut;
+    z.ntrans = tc;
+    z.ntypes = ty;
+
+    # footer: "\n<POSIX TZ>\n"
+    z.has_rule = false;
+    if (version >= '2' && pos < n && d[pos] == '\n') {
+        var e: usize = pos + 1;
+        for (e < n && d[e] != '\n') { e = e + 1; }
+        if (e > pos + 1) { parse_rule(z, ?d[pos + 1], e - pos - 1); }
+    }
+    ret true;
+}
+
+fun load() {
+    if (zone_tried) { ret; }
+    zone_tried  = true;
+    zone.loaded = false;
+    val r: res[Vector[u8], fs.FsError] = fs.read_bytes(M.allocator(), "/etc/localtime");
+    if (sel r.err) { ret; }
+    var v: Vector[u8] = r.ok;
+    zone.loaded = load_tzif(?zone, v.data, v.len);
+    V.dnit[u8](?v);
+}
+
+# UTC offset in seconds east of Greenwich at a UTC instant
+pub fun offset_at(t: i64) i64 {
+    load();
+    if (!zone.loaded) { ret 0; }
+    if (zone.ntrans == 0 || t >= zone.trans[zone.ntrans - 1]) {
+        if (zone.has_rule)    { ret rule_offset(?zone, t); }
+        if (zone.ntrans == 0) { ret zone.offs[0]; }
+        ret zone.offs[zone.idx[zone.ntrans - 1]::usize];
+    }
+    if (t < zone.trans[0]) { ret zone.offs[0]; }
+    # last transition at or before t
+    var lo: usize = 0;
+    var hi: usize = zone.ntrans - 1;
+    for (lo < hi) {
+        val mid: usize = (lo + hi + 1) / 2;
+        if (zone.trans[mid] <= t) { lo = mid; }
+        or                        { hi = mid - 1; }
+    }
+    ret zone.offs[zone.idx[lo]::usize];
+}
+
+# the UTC instant of a local wall-clock time (seconds since 1970 as if UTC)
+pub fun local_to_utc(local: i64) i64 {
+    var u: i64 = local - offset_at(local);
+    # one refinement settles times near a transition
+    u = local - offset_at(u);
+    ret u;
+}
+
+test localtime__rule_offsets {
+    # central Europe: UTC+1, UTC+2 from the last Sunday of March 01:00 UTC
+    # to the last Sunday of October 01:00 UTC
+    var z: Zone;
+    z.loaded  = true;
+    z.ntrans  = 0;
+    z.ntypes  = 1;
+    z.offs[0] = 3600;
+    val rule: str = "CET-1CEST,M3.5.0,M10.5.0/3";
+    parse_rule(?z, rule::*u8, 26);
+    if (!z.has_rule || z.std_off != 3600 || z.dst_off != 7200) { ret 1; }
+    # 2026-03-29 00:59:59 UTC is still winter time, 01:00:00 is summer time
+    if (rule_offset(?z, 1774745999) != 3600) { ret 2; }
+    if (rule_offset(?z, 1774746000) != 7200) { ret 3; }
+    # 2026-10-25 00:59:59 UTC is summer time, 01:00:00 winter time
+    if (rule_offset(?z, 1792889999) != 7200) { ret 4; }
+    if (rule_offset(?z, 1792890000) != 3600) { ret 5; }
+    ret 0;
+}

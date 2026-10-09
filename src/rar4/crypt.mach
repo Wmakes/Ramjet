@@ -1,0 +1,108 @@
+# RAR 2.9-4.x key derivation (AES-128)
+#
+# not described in the RAR 4.20 technote. confirmed black-box against
+# archives RAR 4.20 encrypted (tests/samples/rar4/all_encrypted.rar,
+# all_hdr_encrypted.rar, volumes_enc):
+#
+#   input  = password as UTF-16LE, then the 8-byte salt
+#   repeat 2^18 times, i = 0, 1, ...: SHA-1 absorbs input and i as 3 bytes
+#   (little endian); every 2^14 rounds, byte 19 of the digest so far is the
+#   next IV byte
+#   key    = first 16 bytes of the final digest, byte order reversed within
+#            each 32-bit word
+#
+# passwords whose UTF-16 form plus salt reaches 64 bytes are hashed as
+# written here; some old RAR versions differ for those, which is untested.
+
+use std.types.size.usize;
+
+use SHA: ramjet.crypto.sha1;
+
+val ROUNDS: u32 = 0x40000;
+
+pub rec Keys {
+    key: [16]u8;
+    iv:  [16]u8;
+}
+
+# UTF-8 password to UTF-16LE; returns bytes written (at most cap)
+fun utf16le(pw: *u8, n: usize, out: *u8, cap: usize) usize {
+    var i: usize = 0;
+    var o: usize = 0;
+    for (i < n && o + 4 <= cap) {
+        var cp:    u32   = pw[i]::u32;
+        var extra: usize = 0;
+        if (cp >= 0xF0) {
+            cp    = cp & 0x07;
+            extra = 3;
+        }
+        or (cp >= 0xE0) {
+            cp    = cp & 0x0F;
+            extra = 2;
+        }
+        or (cp >= 0xC0) {
+            cp    = cp & 0x1F;
+            extra = 1;
+        }
+        i = i + 1;
+        var k: usize = 0;
+        for (k < extra && i < n) {
+            cp = (cp << 6) | (pw[i] & 0x3F)::u32;
+            i  = i + 1;
+            k  = k + 1;
+        }
+        if (cp >= 0x10000) {
+            val v:  u32 = cp - 0x10000;
+            val hi: u32 = 0xD800 + (v >> 10);
+            val lo: u32 = 0xDC00 + (v & 0x3FF);
+            out[o]     = (hi & 0xFF)::u8;
+            out[o + 1] = (hi >> 8)::u8;
+            out[o + 2] = (lo & 0xFF)::u8;
+            out[o + 3] = (lo >> 8)::u8;
+            o          = o + 4;
+        }
+        or {
+            out[o]     = (cp & 0xFF)::u8;
+            out[o + 1] = (cp >> 8)::u8;
+            o          = o + 2;
+        }
+    }
+    ret o;
+}
+
+pub fun derive(password: *u8, pw_len: usize, salt: *u8, out: *Keys) {
+    var raw: [520]u8;
+    var n:   usize = utf16le(password, pw_len, ?raw[0], 504);
+    var i:   usize = 0;
+    for (i < 8) {
+        raw[n + i] = salt[i];
+        i          = i + 1;
+    }
+    n = n + 8;
+
+    var s: SHA.Sha1;
+    SHA.init(?s);
+    var ctr: [3]u8;
+    var r:   u32 = 0;
+    for (r < ROUNDS) {
+        SHA.update(?s, ?raw[0], n);
+        ctr[0] = (r & 0xFF)::u8;
+        ctr[1] = ((r >> 8) & 0xFF)::u8;
+        ctr[2] = ((r >> 16) & 0xFF)::u8;
+        SHA.update(?s, ?ctr[0], 3);
+        if (r % (ROUNDS / 16) == 0) {
+            var snap: SHA.Sha1 = s;
+            var d:    [20]u8;
+            SHA.final(?snap, ?d[0]);
+            out.iv[(r / (ROUNDS / 16))::usize] = d[19];
+        }
+        r = r + 1;
+    }
+    var d: [20]u8;
+    SHA.final(?s, ?d[0]);
+    i = 0;
+    for (i < 16) {
+        out.key[i] = d[(i & 0xFC) + 3 - (i & 3)];
+        i          = i + 1;
+    }
+}

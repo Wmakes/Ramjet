@@ -1,0 +1,772 @@
+# an open RAR archive: its volumes and the entries they hold
+#
+# every volume is mapped read-only. open() walks the headers of the first
+# volume and of each following volume the end header announces, and builds
+# one Entry per archived file or service record. a file split across volumes
+# becomes one Entry with one Segment per volume part.
+
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+
+use V: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use iofile:   std.io.file;
+
+use B: ramjet.bytes;
+use ramjet.crypto.aes;
+use E:  ramjet.errors;
+use M:  ramjet.mem;
+use C4: ramjet.rar4.crypt;
+use H4: ramjet.rar4.header;
+use C:  ramjet.rar5.crypt;
+use H:  ramjet.rar5.header;
+
+pub val SFX_SEARCH_LIMIT: usize = 0x1000000;
+
+# one mapped volume file
+pub rec Volume {
+    name: *u8;
+    file: fs.File;
+    map:  iofile.Mapping;
+    data: *u8;
+    size: usize;
+}
+
+# one volume's part of an entry's data area
+# ---
+# next:       index of the entry's next segment, or -1
+# vol:        volume index
+# offset:     position of the data area in that volume
+# size:       bytes of data area
+# crc:        stored CRC32 of this part (packed data for all parts but the
+#             last, unpacked data for the last)
+# has_crc:    the header carried a CRC32
+# has_blake2: the header carried a BLAKE2sp hash
+# blake2:     stored BLAKE2sp of this part, same convention as crc
+pub rec Segment {
+    next:       i64;
+    vol:        usize;
+    offset:     u64;
+    size:       u64;
+    crc:        u32;
+    has_crc:    bool;
+    has_blake2: bool;
+    blake2:     [32]u8;
+}
+
+# one file or service record
+# ---
+# h:         the header of the first part (names and extras point into a
+#            copy owned by the archive)
+# service:   a service header (CMT, QO, RR, ACL, STM)
+# name:      NUL-terminated name
+# link:      NUL-terminated redirection target, or nil
+# seg_first: first Segment of this entry in the archive's segment list
+# seg_last:  last Segment, where a continuation is linked on
+# seg_count: number of segments
+# complete:  the last part was found (no SPLIT_AFTER on the final segment)
+# header_ok: every header of every part passed its CRC
+# parent:    for a service header, index of the file entry it follows, or -1
+pub rec Entry {
+    h:         H.FileHeader;
+    service:   bool;
+    name:      *u8;
+    link:      *u8;
+    seg_first: usize;
+    seg_last:  usize;
+    seg_count: usize;
+    complete:  bool;
+    header_ok: bool;
+    parent:    i64;
+}
+
+pub rec Archive {
+    vols:    Vector[Volume];
+    entries: Vector[Entry];
+    segs:    Vector[Segment];
+
+    main:                H.MainHeader;
+    solid:               bool;
+    volume:              bool;
+    locked:              bool;
+    recovery:            bool;
+    first_volume_number: u64;
+
+    # header encryption
+    head_crypt:        H.Crypt;
+    head_keys:         C.Keys;
+    encrypted_headers: bool;
+
+    password: *u8;
+    pw_len:   usize;
+
+    # damage seen while walking headers
+    bad_headers:    usize;
+    truncated:      bool;
+    missing_volume: bool;
+
+    comment:     *u8;
+    comment_len: usize;
+
+    # entry whose data continues in the next volume, or -1
+    open_split: i64;
+
+    # RAR 1.5-4.x archive
+    rar4: bool;
+
+    # RAR 1.5-4.x header encryption: keys for the last salt seen
+    head4_valid: bool;
+    head4_salt:  [8]u8;
+    head4_keys:  C4.Keys;
+}
+
+fun open_volume(name: *u8, out: *Volume) E.Code {
+    val ro: res[fs.File, io_error.Error] = fs.open(name);
+    if (sel ro.err) { ret E.OPEN; }
+    var f:  fs.File                          = ro.ok;
+    val st: res[fs.Metadata, io_error.Error] = fs.stat_of(f);
+    if (sel st.err) {
+        fs.close(?f);
+        ret E.READ;
+    }
+    val size: usize = st.ok.size;
+    if (size == 0) {
+        fs.close(?f);
+        ret E.NOT_RAR;
+    }
+    val mr: res[iofile.Mapping, io_error.Error] = iofile.map(f, 0, size, false);
+    if (sel mr.err) {
+        fs.close(?f);
+        ret E.READ;
+    }
+    out.name = M.dup(name, M.cstr_len(name));
+    out.file = f;
+    out.map  = mr.ok;
+    out.data = mr.ok.data::*u8;
+    out.size = size;
+    ret E.OK;
+}
+
+fun close_volume(v: *Volume) {
+    iofile.mapping_close(?v.map);
+    fs.close(?v.file);
+}
+
+# position just past the RAR5 signature, searching an SFX prefix if needed
+# ---
+# ret: offset after the signature, 0 when none was found; sets rar4 when it
+#      is the 7-byte RAR 1.5-4.x signature
+pub fun find_signature(p: *u8, size: usize, rar4: *bool) usize {
+    @rar4 = false;
+    var limit: usize = size;
+    if (limit > SFX_SEARCH_LIMIT) { limit = SFX_SEARCH_LIMIT; }
+    var i: usize = 0;
+    for (i + 7 <= limit) {
+        if (p[i] == 0x52 && p[i + 1] == 0x61 && p[i + 2] == 0x72 && p[i + 3] == 0x21 &&
+            p[i + 4] == 0x1A && p[i + 5] == 0x07) {
+            if (p[i + 6] == 0x01 && i + 8 <= size && p[i + 7] == 0x00) { ret i + 8; }
+            if (p[i + 6] == 0x00) {
+                @rar4 = true;
+                ret i + 7;
+            }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the name of the volume after `name`, or nil
+#
+# "x.partN.rar" increments N keeping its width; "x.rar" -> "x.r00" -> "x.r01"
+# is the older scheme, still produced by some tools.
+pub fun next_volume_name(name: *u8) *u8 {
+    val n: usize = M.cstr_len(name);
+    if (n < 4) { ret nil; }
+
+    # ".partN.rar" form: find the digits right before ".rar"
+    if (lower(name[n - 4]) == '.' && lower(name[n - 3]) == 'r' && lower(name[n - 2]) == 'a' && lower(name[n - 1]) == 'r') {
+        var d_end:   usize = n - 4;
+        var d_start: usize = d_end;
+        for (d_start > 0 && is_digit(name[d_start - 1])) { d_start = d_start - 1; }
+        if (d_start < d_end && d_start >= 5 &&
+            lower(name[d_start - 1]) == 't' && lower(name[d_start - 2]) == 'r' &&
+            lower(name[d_start - 3]) == 'a' && lower(name[d_start - 4]) == 'p' && name[d_start - 5] == '.') {
+            val out: *u8 = M.alloc(n + 2);
+            if (out == nil) { ret nil; }
+            M.copy(out, name, n + 1);
+            var i: usize = d_end;
+            for (i > d_start) {
+                i = i - 1;
+                if (out[i] == '9') {
+                    out[i] = '0';
+                }
+                or {
+                    out[i] = out[i] + 1;
+                    ret out;
+                }
+            }
+            # every digit wrapped: widen with a leading 1
+            M.move(?out[d_start + 1], ?out[d_start], n + 1 - d_start);
+            out[d_start] = '1';
+            ret out;
+        }
+        # plain "x.rar" starts the old scheme
+        val out: *u8 = M.dup(name, n);
+        if (out == nil) { ret nil; }
+        out[n - 2] = '0';
+        out[n - 1] = '0';
+        ret out;
+    }
+
+    # ".r00" .. ".r99", then ".s00" ..
+    if (name[n - 4] == '.' && is_digit(name[n - 2]) && is_digit(name[n - 1])) {
+        val out: *u8 = M.dup(name, n);
+        if (out == nil) { ret nil; }
+        if (out[n - 1] != '9') {
+            out[n - 1] = out[n - 1] + 1;
+        }
+        or {
+            out[n - 1] = '0';
+            if (out[n - 2] != '9') {
+                out[n - 2] = out[n - 2] + 1;
+            }
+            or {
+                out[n - 2] = '0';
+                out[n - 3] = out[n - 3] + 1;
+            }
+        }
+        ret out;
+    }
+    ret nil;
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun is_digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+# read one header at `pos` of a volume into a plaintext buffer
+#
+# with plain headers the buffer is the mapping itself. with encrypted headers
+# a 16-byte IV precedes AES-CBC data padded to 16 bytes; the plaintext goes
+# into a fresh allocation that the caller keeps or frees.
+# ---
+# head:     the parsed common fields
+# buf:      receives the plaintext header start
+# owned:    receives true when buf was allocated (size in owned_len)
+# disk_len: receives bytes the header occupies in the volume
+fun read_header(ar: *Archive, v: *Volume, pos: usize, head: *H.Block, buf: **u8, owned_len: *usize, disk_len: *usize) E.Code {
+    @owned_len = 0;
+    if (pos >= v.size) { ret E.TRUNCATED; }
+    val avail: usize = v.size - pos;
+
+    if (!ar.encrypted_headers) {
+        val total: usize = H.peek_total(?v.data[pos], avail);
+        if (total == 0)                                { ret E.BAD_HEADER; }
+        if (total > avail)                             { ret E.TRUNCATED; }
+        if (!H.parse_block(?v.data[pos], avail, head)) { ret E.BAD_HEADER; }
+        @buf      = ?v.data[pos];
+        @disk_len = total;
+        ret E.OK;
+    }
+
+    if (avail < 32) { ret E.TRUNCATED; }
+    var k: aes.Key;
+    aes.init(?k, ?ar.head_keys.key[0]);
+    var iv: [16]u8;
+    M.copy(?iv[0], ?v.data[pos], 16);
+    var first: [16]u8;
+    M.copy(?first[0], ?v.data[pos + 16], 16);
+    var iv2: [16]u8;
+    M.copy(?iv2[0], ?iv[0], 16);
+    aes.cbc_decrypt(?k, ?iv2[0], ?first[0], 16);
+    val total: usize = H.peek_total(?first[0], 16);
+    if (total == 0) { ret E.BAD_PASSWORD; }
+    val padded: usize = (total + 15) & (0 - 16)::usize;
+    if (16 + padded > avail) { ret E.TRUNCATED; }
+    val p: *u8 = M.alloc(padded);
+    if (p == nil) { ret E.NO_MEMORY; }
+    M.copy(p, ?v.data[pos + 16], padded);
+    aes.cbc_decrypt(?k, ?iv[0], p, padded);
+    if (!H.parse_block(p, total, head)) {
+        M.free(p, padded);
+        ret E.BAD_HEADER;
+    }
+    @buf       = p;
+    @owned_len = padded;
+    @disk_len  = 16 + padded;
+    ret E.OK;
+}
+
+# derive keys for the archive encryption header and verify the password
+fun unlock_headers(ar: *Archive) E.Code {
+    if (ar.password == nil)         { ret E.NEED_PASSWORD; }
+    if (ar.head_crypt.version != 0) { ret E.UNSUPPORTED; }
+    if (!C.derive(ar.password, ar.pw_len, ?ar.head_crypt.salt[0], ar.head_crypt.kdf_count, ?ar.head_keys)) {
+        ret E.UNSUPPORTED;
+    }
+    if ((ar.head_crypt.flags & H.CRYPT_PSWCHECK) != 0 && C.check_value_intact(?ar.head_crypt.check[0])) {
+        if (!C.check_matches(?ar.head_keys, ?ar.head_crypt.check[0])) { ret E.BAD_PASSWORD; }
+    }
+    ret E.OK;
+}
+
+# record one file or service header part: a new entry, or the next segment
+# of the entry it continues from the previous volume
+fun add_part(ar: *Archive, vi: usize, fh: *H.FileHeader, service: bool, split_before: bool, split_after: bool,
+    crc_ok: bool, data_pos: u64, data_size: u64, last_file: *i64) E.Code {
+    val v:   *Volume = ?ar.vols.data[vi];
+    var seg: Segment;
+    seg.next       = -1;
+    seg.vol        = vi;
+    seg.offset     = data_pos;
+    seg.size       = data_size;
+    seg.crc        = fh.data_crc;
+    seg.has_crc    = (fh.flags & H.FHFL_CRC32) != 0;
+    seg.has_blake2 = fh.has_blake2;
+    M.copy(?seg.blake2[0], ?fh.blake2[0], 32);
+
+    val continues: bool   = split_before;
+    var prev:      *Entry = nil;
+    if (continues && ar.open_split >= 0) {
+        prev = ?ar.entries.data[ar.open_split::usize];
+        if (prev.complete || prev.service != (service) || !same_name(prev, fh)) { prev = nil; }
+    }
+    if (prev != nil) {
+        segment(ar, prev.seg_last).next = ar.segs.len::i64;
+        prev.seg_last                   = ar.segs.len;
+        V.push[Segment](?ar.segs, seg);
+        prev.seg_count = prev.seg_count + 1;
+        prev.complete  = !split_after;
+        if (prev.complete) { ar.open_split = -1; }
+        if (!crc_ok)       { prev.header_ok = false; }
+        # the size and checksums of the final part are authoritative
+        if (prev.complete) {
+            prev.h.unp_size   = fh.unp_size;
+            prev.h.data_crc   = fh.data_crc;
+            prev.h.has_blake2 = fh.has_blake2;
+            M.copy(?prev.h.blake2[0], ?fh.blake2[0], 32);
+        }
+    }
+    or {
+        var e: Entry;
+        e.h       = @fh;
+        e.service = service;
+        e.name    = versioned_name(fh);
+        e.link    = nil;
+        if (fh.redir_type != H.REDIR_NONE && fh.redir_name != nil) { e.link = M.dup(fh.redir_name, fh.redir_len); }
+        e.seg_first = ar.segs.len;
+        e.seg_last  = ar.segs.len;
+        e.seg_count = 1;
+        # a part that continues a file we never saw cannot be completed
+        e.complete  = !split_after && !continues;
+        e.header_ok = crc_ok;
+        e.parent    = -1;
+        if (e.service) {
+            e.parent = @last_file;
+        }
+        or {
+            @last_file = ar.entries.len::i64;
+        }
+        if (split_after) { ar.open_split = ar.entries.len::i64; }
+        V.push[Segment](?ar.segs, seg);
+        V.push[Entry](?ar.entries, e);
+
+        if (e.service && H.name_is(fh, "CMT"::*u8, 3) && fh.method == 0 && seg.size > 0 && !fh.crypt.present &&
+            data_pos + seg.size <= v.size::u64) {
+            ar.comment     = ?v.data[data_pos::usize];
+            ar.comment_len = seg.size::usize;
+        }
+    }
+    ret E.OK;
+}
+
+# decrypt the RAR 2.9-4.x header at pos into a fresh buffer
+# ---
+# hp:   receives the plaintext header
+# disk: receives the bytes it occupies in the volume, salt included
+fun decrypt_header4(ar: *Archive, v: *Volume, pos: usize, hp: **u8, disk: *usize) E.Code {
+    if (pos + 24 > v.size) { ret E.TRUNCATED; }
+    val salt: *u8   = ?v.data[pos];
+    var same: bool  = ar.head4_valid;
+    var i:    usize = 0;
+    for (same && i < 8) {
+        if (ar.head4_salt[i] != salt[i]) { same = false; }
+        i = i + 1;
+    }
+    if (!same) {
+        C4.derive(ar.password, ar.pw_len, salt, ?ar.head4_keys);
+        M.copy(?ar.head4_salt[0], salt, 8);
+        ar.head4_valid = true;
+    }
+    var k: aes.Key;
+    aes.init128(?k, ?ar.head4_keys.key[0]);
+    var first: [16]u8;
+    var iv:    [16]u8;
+    M.copy(?first[0], ?v.data[pos + 8], 16);
+    M.copy(?iv[0], ?ar.head4_keys.iv[0], 16);
+    aes.cbc_decrypt(?k, ?iv[0], ?first[0], 16);
+    val total: usize = first[5]::usize | (first[6]::usize << 8);
+    if (total < 7) { ret E.BAD_PASSWORD; }
+    val padded: usize = (total + 15) & (0 - 16)::usize;
+    if (pos + 8 + padded > v.size) { ret E.TRUNCATED; }
+    val p: *u8 = M.alloc(padded);
+    if (p == nil) { ret E.NO_MEMORY; }
+    M.copy(p, ?v.data[pos + 8], padded);
+    M.copy(?iv[0], ?ar.head4_keys.iv[0], 16);
+    aes.cbc_decrypt(?k, ?iv[0], p, padded);
+    @hp   = p;
+    @disk = 8 + padded;
+    ret E.OK;
+}
+
+# walk the headers of one RAR 1.5-4.x volume, starting after the marker
+fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
+    @more = false;
+    val v:         *Volume = ?ar.vols.data[vi];
+    var pos:       usize   = start;
+    var last_file: i64     = -1;
+    var saw_end:   bool    = false;
+    ar.encrypted_headers = false;
+    for (pos < v.size) {
+        var b:    H4.Block;
+        var hp:   *u8   = ?v.data[pos];
+        var disk: usize = 0;
+        if (ar.encrypted_headers) {
+            # 8-byte salt, then the header in AES-128-CBC padded to 16 bytes
+            val dc: E.Code = decrypt_header4(ar, v, pos, ?hp, ?disk);
+            if (dc == E.TRUNCATED) {
+                ar.truncated = true;
+                brk;
+            }
+            if (dc != E.OK)                        { ret dc; }
+            if (!H4.parse_block(hp, disk - 8, ?b)) { ret E.BAD_PASSWORD; }
+        }
+        or {
+            if (!H4.parse_block(hp, v.size - pos, ?b)) {
+                # trailing bytes that are not a block end the walk; a block
+                # that does not fit means the volume was cut short
+                if (v.size - pos >= 7) { ar.truncated = true; }
+                brk;
+            }
+            disk = b.total;
+        }
+        if (!b.crc_ok) {
+            # with encrypted headers a bad CRC means a wrong password
+            if (ar.encrypted_headers) { ret E.BAD_PASSWORD; }
+            ar.bad_headers = ar.bad_headers + 1;
+        }
+        val data_pos: u64 = (pos + disk)::u64;
+        val next:     u64 = data_pos + b.data_size;
+
+        if (b.htype == H4.HEAD_MAIN) {
+            if (vi == 0) {
+                ar.solid    = (b.flags & H4.MHD_SOLID) != 0;
+                ar.volume   = (b.flags & H4.MHD_VOLUME) != 0;
+                ar.locked   = (b.flags & H4.MHD_LOCK) != 0;
+                ar.recovery = (b.flags & H4.MHD_PROTECT) != 0;
+            }
+            if ((b.flags & H4.MHD_PASSWORD) != 0) {
+                if (ar.password == nil) { ret E.NEED_PASSWORD; }
+                ar.encrypted_headers = true;
+            }
+        }
+        or (b.htype == H4.HEAD_FILE || b.htype == H4.HEAD_NEWSUB) {
+            var fh: H.FileHeader;
+            if (!H4.parse_file(hp, ?b, ?fh)) { ret E.BAD_HEADER; }
+            # a Unix symbolic link is an entry whose data is the target
+            val is_link: bool = b.htype == H4.HEAD_FILE && fh.host_os == H.HOST_UNIX && (fh.attr & 0xF000) == 0xA000;
+            if (is_link) { fh.redir_type = H.REDIR_UNIX_SYMLINK; }
+            val ac: E.Code = add_part(ar, vi, ?fh, b.htype == H4.HEAD_NEWSUB, (b.flags & H4.LHD_SPLIT_BEFORE) != 0,
+                (b.flags & H4.LHD_SPLIT_AFTER) != 0, b.crc_ok, data_pos, b.data_size, ?last_file);
+            if (ac != E.OK) { ret ac; }
+            if (is_link && fh.method == 0 && !fh.crypt.present && (b.flags & H4.LHD_SPLIT_AFTER) == 0 &&
+                b.data_size < 0x10000 && data_pos + b.data_size <= v.size::u64) {
+                val e: *Entry = entry(ar, ar.entries.len - 1);
+                e.link = M.dup(?v.data[data_pos::usize], b.data_size::usize);
+            }
+        }
+        or (b.htype == H4.HEAD_END) {
+            @more   = (b.flags & H4.EARC_NEXT_VOLUME) != 0;
+            saw_end = true;
+            brk;
+        }
+        # other blocks (old comments, recovery data, signatures) are skipped
+        if (next > v.size::u64) {
+            ar.truncated = true;
+            brk;
+        }
+        pos = next::usize;
+    }
+    # RAR 2.x volumes have no end block; their main header says "volume"
+    if (!saw_end && ar.volume && !ar.truncated) {
+        val last: i64 = ar.open_split;
+        @more = last >= 0;
+    }
+    ret E.OK;
+}
+
+# walk the headers of one volume
+# ---
+# ret: OK; `more` is set when the end header announces another volume
+fun scan_volume(ar: *Archive, vi: usize, more: *bool) E.Code {
+    @more = false;
+    val v:    *Volume = ?ar.vols.data[vi];
+    var rar4: bool    = false;
+    var pos:  usize   = find_signature(v.data, v.size, ?rar4);
+    if (pos == 0)        { ret E.NOT_RAR; }
+    if (vi == 0)         { ar.rar4 = rar4; }
+    if (rar4 != ar.rar4) { ret E.NOT_RAR; }
+    if (rar4)            { ret scan_volume4(ar, vi, pos, more); }
+
+    var seen_main: bool = false;
+    var last_file: i64  = -1;
+    # every volume starts with its own plaintext encryption header
+    ar.encrypted_headers = false;
+
+    for (pos < v.size) {
+        var blk:   H.Block;
+        var buf:   *u8    = nil;
+        var owned: usize  = 0;
+        var disk:  usize  = 0;
+        val rc:    E.Code = read_header(ar, v, pos, ?blk, ?buf, ?owned, ?disk);
+        if (rc == E.TRUNCATED) {
+            ar.truncated = true;
+            ret E.OK;
+        }
+        if (rc != E.OK) { ret rc; }
+        if (!blk.crc_ok) {
+            ar.bad_headers = ar.bad_headers + 1;
+            if (ar.encrypted_headers && !seen_main) {
+                # a wrong password shows up as garbage with a bad CRC
+                ret E.BAD_PASSWORD;
+            }
+        }
+
+        val data_pos: u64 = (pos + disk)::u64;
+        if (data_pos + blk.data_size > v.size::u64) { ar.truncated = true; }
+        var next: u64 = data_pos + blk.data_size;
+
+        if (blk.htype == H.HEAD_CRYPT) {
+            var hc: H.Crypt;
+            if (!H.parse_crypt_head(?blk, ?hc)) { ret E.BAD_HEADER; }
+            # volumes usually share one salt; derive again only when it changes
+            var same: bool  = ar.head_crypt.present && ar.head_crypt.kdf_count == hc.kdf_count;
+            var k:    usize = 0;
+            for (same && k < 16) {
+                if (ar.head_crypt.salt[k] != hc.salt[k]) { same = false; }
+                k = k + 1;
+            }
+            ar.encrypted_headers = true;
+            if (!same) {
+                ar.head_crypt = hc;
+                val uc: E.Code = unlock_headers(ar);
+                if (uc != E.OK) { ret uc; }
+            }
+        }
+        or (blk.htype == H.HEAD_MAIN) {
+            var mh: H.MainHeader;
+            if (!H.parse_main(?blk, ?mh)) { ret E.BAD_HEADER; }
+            seen_main = true;
+            if (vi == 0) {
+                ar.main                = mh;
+                ar.solid               = (mh.flags & H.MHFL_SOLID) != 0;
+                ar.volume              = (mh.flags & H.MHFL_VOLUME) != 0;
+                ar.locked              = (mh.flags & H.MHFL_LOCK) != 0;
+                ar.recovery            = (mh.flags & H.MHFL_PROTECT) != 0;
+                ar.first_volume_number = mh.volume;
+            }
+        }
+        or (blk.htype == H.HEAD_FILE || blk.htype == H.HEAD_SERVICE) {
+            var fh: H.FileHeader;
+            if (!H.parse_file(?blk, ?fh)) { ret E.BAD_HEADER; }
+            # names and extras point into buf; keep a copy when buf is the
+            # mapping too, so every entry owns what it points at
+            if (owned == 0) {
+                val copy: *u8 = M.dup(buf, blk.total);
+                if (copy == nil) { ret E.NO_MEMORY; }
+                rebase(?fh, buf, copy);
+            }
+            val ac: E.Code = add_part(ar, vi, ?fh, blk.htype == H.HEAD_SERVICE, (blk.hflags & H.HFL_SPLIT_BEFORE) != 0,
+                (blk.hflags & H.HFL_SPLIT_AFTER) != 0, blk.crc_ok, data_pos, blk.data_size, ?last_file);
+            if (ac != E.OK) { ret ac; }
+        }
+        or (blk.htype == H.HEAD_END) {
+            val eflags: u64 = H.parse_end(?blk);
+            if (owned != 0) { M.free(buf, owned); }
+            @more = (eflags & H.EHFL_NEXTVOLUME) != 0;
+            ret E.OK;
+        }
+        # unknown header types are skipped by their sizes
+
+        if (owned != 0 && blk.htype != H.HEAD_FILE && blk.htype != H.HEAD_SERVICE) { M.free(buf, owned); }
+        if (next > v.size::u64) {
+            ar.truncated = true;
+            ret E.OK;
+        }
+        pos = next::usize;
+    }
+    ar.truncated = true;
+    ret E.OK;
+}
+
+# the archived name, with ";N" appended for an older file version (-ver)
+fun versioned_name(fh: *H.FileHeader) *u8 {
+    if (fh.file_version == 0) { ret M.dup(fh.name, fh.name_len); }
+    var digits: [24]u8;
+    var nd:     usize = 0;
+    var v:      u64   = fh.file_version;
+    for (v > 0) {
+        digits[nd] = ('0'::u64 + v % 10)::u8;
+        v          = v / 10;
+        nd         = nd + 1;
+    }
+    val out: *u8 = M.alloc(fh.name_len + nd + 2);
+    if (out == nil) { ret nil; }
+    M.copy(out, fh.name, fh.name_len);
+    out[fh.name_len] = ';';
+    var i: usize = 0;
+    for (i < nd) {
+        out[fh.name_len + 1 + i] = digits[nd - 1 - i];
+        i                        = i + 1;
+    }
+    out[fh.name_len + 1 + nd] = 0;
+    ret out;
+}
+
+# a continuation header names the file it continues
+fun same_name(e: *Entry, fh: *H.FileHeader) bool {
+    if (e.h.file_version != fh.file_version) { ret false; }
+    if (fh.file_version != 0)                { ret e.h.name_len == fh.name_len; }
+    if (M.cstr_len(e.name) != fh.name_len)   { ret false; }
+    var i: usize = 0;
+    for (i < fh.name_len) {
+        if (e.name[i] != fh.name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# repoint the borrowed fields of a header from one buffer to its copy
+fun rebase(fh: *H.FileHeader, from: *u8, to: *u8) {
+    val base: usize = from::usize;
+    val dest: usize = to::usize;
+    fh.name = (fh.name::usize - base + dest)::*u8;
+    if (fh.redir_name != nil) { fh.redir_name = (fh.redir_name::usize - base + dest)::*u8; }
+    if (fh.user_name != nil)  { fh.user_name = (fh.user_name::usize - base + dest)::*u8; }
+    if (fh.group_name != nil) { fh.group_name = (fh.group_name::usize - base + dest)::*u8; }
+    if (fh.subdata != nil)    { fh.subdata = (fh.subdata::usize - base + dest)::*u8; }
+}
+
+# open an archive and every volume that follows it
+# ---
+# password: NUL-terminated UTF-8 password, or nil
+pub fun open(ar: *Archive, path: *u8, password: *u8) E.Code {
+    ar.vols                = V.init[Volume](M.allocator());
+    ar.entries             = V.init[Entry](M.allocator());
+    ar.segs                = V.init[Segment](M.allocator());
+    ar.solid               = false;
+    ar.volume              = false;
+    ar.locked              = false;
+    ar.recovery            = false;
+    ar.first_volume_number = 0;
+    ar.head_crypt.present  = false;
+    ar.encrypted_headers   = false;
+    ar.password            = password;
+    ar.pw_len              = M.cstr_len(password);
+    ar.bad_headers         = 0;
+    ar.truncated           = false;
+    ar.missing_volume      = false;
+    ar.comment             = nil;
+    ar.comment_len         = 0;
+    ar.open_split          = -1;
+    ar.rar4                = false;
+    ar.head4_valid         = false;
+
+    var name: *u8   = M.dup(path, M.cstr_len(path));
+    var vi:   usize = 0;
+    for {
+        var v:  Volume;
+        val oc: E.Code = open_volume(name, ?v);
+        if (oc != E.OK) {
+            if (vi == 0) { ret oc; }
+            ar.missing_volume = true;
+            ret E.OK;
+        }
+        V.push[Volume](?ar.vols, v);
+        var more: bool   = false;
+        val sc:   E.Code = scan_volume(ar, vi, ?more);
+        if (sc != E.OK) {
+            if (vi == 0) { ret sc; }
+            ret E.OK;
+        }
+        if (!more) { ret E.OK; }
+        name = next_volume_name(name);
+        if (name == nil) {
+            ar.missing_volume = true;
+            ret E.OK;
+        }
+        vi = vi + 1;
+    }
+    ret E.OK;
+}
+
+pub fun close(ar: *Archive) {
+    var i: usize = 0;
+    for (i < ar.vols.len) {
+        close_volume(?ar.vols.data[i]);
+        i = i + 1;
+    }
+}
+
+pub fun entry(ar: *Archive, i: usize) *Entry {
+    ret ?ar.entries.data[i];
+}
+
+pub fun segment(ar: *Archive, i: usize) *Segment {
+    ret ?ar.segs.data[i];
+}
+
+pub fun volume(ar: *Archive, i: usize) *Volume {
+    ret ?ar.vols.data[i];
+}
+
+# packed bytes of an entry over all its parts
+pub fun packed_size(ar: *Archive, e: *Entry) u64 {
+    var total: u64 = 0;
+    var i:     i64 = e.seg_first::i64;
+    for (i >= 0) {
+        val s: *Segment = segment(ar, i::usize);
+        total = total + s.size;
+        i     = s.next;
+    }
+    ret total;
+}
+
+pub fun is_dir(e: *Entry) bool {
+    ret (e.h.flags & H.FHFL_DIRECTORY) != 0;
+}
+
+test archive__volume_names {
+    val a: *u8 = next_volume_name("x.part1.rar"::*u8);
+    if (!M.cstr_eq(a, "x.part2.rar"::*u8)) { ret 1; }
+    val b: *u8 = next_volume_name("x.part09.rar"::*u8);
+    if (!M.cstr_eq(b, "x.part10.rar"::*u8)) { ret 2; }
+    val c: *u8 = next_volume_name("x.part9.rar"::*u8);
+    if (!M.cstr_eq(c, "x.part10.rar"::*u8)) { ret 3; }
+    val d: *u8 = next_volume_name("x.rar"::*u8);
+    if (!M.cstr_eq(d, "x.r00"::*u8)) { ret 4; }
+    val e: *u8 = next_volume_name("x.r09"::*u8);
+    if (!M.cstr_eq(e, "x.r10"::*u8)) { ret 5; }
+    ret 0;
+}

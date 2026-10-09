@@ -1,0 +1,252 @@
+# the l and lt commands
+
+use std.print;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+use AR: ramjet.archive;
+use E:  ramjet.errors;
+use M:  ramjet.mem;
+use H:  ramjet.rar5.header;
+use T:  ramjet.timefmt;
+
+# ten-character mode string for a Unix host, attribute letters for Windows
+fun attr_string(e: *AR.Entry, out: *u8) {
+    var i: usize = 0;
+    for (i < 10) {
+        out[i] = '-';
+        i      = i + 1;
+    }
+    out[10] = 0;
+    val a: u64 = e.h.attr;
+    if (e.h.host_os == H.HOST_UNIX) {
+        val kind: u64 = a & 0xF000;
+        if (kind == 0x4000)   { out[0] = 'd'; }
+        or (kind == 0xA000)   { out[0] = 'l'; }
+        or (kind == 0x6000)   { out[0] = 'b'; }
+        or (kind == 0x2000)   { out[0] = 'c'; }
+        or (kind == 0x1000)   { out[0] = 'p'; }
+        or (kind == 0xC000)   { out[0] = 's'; }
+        if ((a & 0x100) != 0) { out[1] = 'r'; }
+        if ((a & 0x080) != 0) { out[2] = 'w'; }
+        if ((a & 0x040) != 0) { out[3] = 'x'; }
+        if ((a & 0x020) != 0) { out[4] = 'r'; }
+        if ((a & 0x010) != 0) { out[5] = 'w'; }
+        if ((a & 0x008) != 0) { out[6] = 'x'; }
+        if ((a & 0x004) != 0) { out[7] = 'r'; }
+        if ((a & 0x002) != 0) { out[8] = 'w'; }
+        if ((a & 0x001) != 0) { out[9] = 'x'; }
+        if ((a & 0x800) != 0) { out[3] = 's'; }
+        if ((a & 0x400) != 0) { out[6] = 's'; }
+        if ((a & 0x200) != 0) { out[9] = 't'; }
+    }
+    or {
+        # Windows attributes: ..RHSDA style
+        out[0] = '.';
+        out[1] = '.';
+        if ((a & 0x10) != 0) { out[2] = 'D'; }
+        or                   { out[2] = '.'; }
+        if ((a & 0x20) != 0) { out[3] = 'A'; }
+        or                   { out[3] = '.'; }
+        if ((a & 0x01) != 0) { out[4] = 'R'; }
+        or                   { out[4] = '.'; }
+        if ((a & 0x02) != 0) { out[5] = 'H'; }
+        or                   { out[5] = '.'; }
+        if ((a & 0x04) != 0) { out[6] = 'S'; }
+        or                   { out[6] = '.'; }
+        out[7] = '.';
+        out[8] = '.';
+        out[9] = '.';
+    }
+}
+
+fun print_date(t: H.Time) {
+    if (!t.present) {
+        print.print("                   ");
+        ret;
+    }
+    val c: T.Civil = T.civil(t.sec);
+    print.printf("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", c.year, c.month, c.day, c.hour, c.minute, c.second);
+}
+
+fun print_time_line(label: str, t: H.Time) {
+    if (!t.present) { ret; }
+    print.printf("{}: ", label);
+    print_date(t);
+    print.printf(",{:09}\n", t.nsec);
+}
+
+fun redir_name(t: u64) str {
+    if (t == H.REDIR_UNIX_SYMLINK) { ret "Unix symbolic link"; }
+    if (t == H.REDIR_WIN_SYMLINK)  { ret "Windows symbolic link"; }
+    if (t == H.REDIR_JUNCTION)     { ret "Junction"; }
+    if (t == H.REDIR_HARDLINK)     { ret "Hard link"; }
+    if (t == H.REDIR_FILECOPY)     { ret "File reference"; }
+    ret "Unknown link";
+}
+
+fun print_hex(p: *u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        print.printf("{:02x}", p[i]);
+        i = i + 1;
+    }
+}
+
+# checksums replaced by key-dependent MACs say nothing without the password
+fun tweaked(e: *AR.Entry) bool {
+    ret e.h.crypt.present && (e.h.crypt.flags & H.CRYPT_HASHMAC) != 0;
+}
+
+fun ratio(unp: u64, packed: u64) u64 {
+    if (unp == 0) { ret 0; }
+    ret packed * 100 / unp;
+}
+
+fun print_header(ar: *AR.Archive, archive: *u8) {
+    print.printf("Archive: {}\n", archive::str);
+    if (ar.rar4)              { print.print("Details: RAR 4"); }
+    or                        { print.print("Details: RAR 5"); }
+    if (ar.volume)            { print.printf(", volume {}", ar.first_volume_number + 1); }
+    if (ar.solid)             { print.print(", solid"); }
+    if (ar.recovery)          { print.print(", recovery record"); }
+    if (ar.locked)            { print.print(", lock"); }
+    if (ar.encrypted_headers) { print.print(", encrypted headers"); }
+    print.println("");
+    if (ar.comment != nil) {
+        print.println("Comment:");
+        var i:    usize = 0;
+        var line: [2]u8;
+        line[1] = 0;
+        for (i < ar.comment_len) {
+            line[0] = ar.comment[i];
+            print.print((?line[0])::str);
+            i = i + 1;
+        }
+        if (ar.comment_len > 0 && ar.comment[ar.comment_len - 1] != '\n') { print.println(""); }
+    }
+    print.println("");
+}
+
+fun print_damage(ar: *AR.Archive) i64 {
+    var status: i64 = 0;
+    if (ar.bad_headers > 0) {
+        print.eprintf("ramjet: {} header(s) with bad checksum\n", ar.bad_headers);
+        status = 1;
+    }
+    if (ar.truncated) {
+        print.eprintln("ramjet: archive is truncated");
+        status = 1;
+    }
+    if (ar.missing_volume) {
+        print.eprintln("ramjet: a following volume is missing");
+        status = 1;
+    }
+    ret status;
+}
+
+pub fun list(ar: *AR.Archive, archive: *u8, technical: bool) i64 {
+    print_header(ar, archive);
+    var attr:         [11]u8;
+    var total_unp:    u64 = 0;
+    var total_packed: u64 = 0;
+    var files:        u64 = 0;
+
+    if (!technical) {
+        print.println(" Attributes        Size     Packed Ratio Date       Time     CRC32    Name");
+        print.println(" ----------  ---------- ---------- ----- ---------- -------- -------- ----");
+    }
+
+    var i: usize = 0;
+    for (i < ar.entries.len) {
+        val e:      *AR.Entry = AR.entry(ar, i);
+        val packed: u64       = AR.packed_size(ar, e);
+        if (e.service) {
+            if (technical) {
+                print.printf("        Name: {}\n", e.name::str);
+                print.println("        Type: Service header");
+                print.printf("        Size: {}\n", e.h.unp_size);
+                print.printf(" Packed size: {}\n", packed);
+                print.println("");
+            }
+            i = i + 1;
+            cnt;
+        }
+        attr_string(e, ?attr[0]);
+        files        = files + 1;
+        total_unp    = total_unp + e.h.unp_size;
+        total_packed = total_packed + packed;
+
+        if (!technical) {
+            var flag: u8 = ' ';
+            if (e.h.crypt.present) { flag = '*'; }
+            print.printf("{:c}{}  {:10} {:10} {:4}% ", flag, (?attr[0])::str, e.h.unp_size, packed, ratio(e.h.unp_size, packed));
+            print_date(e.h.mtime);
+            print.printf(" {:08X} {}", e.h.data_crc, e.name::str);
+            if (e.link != nil) { print.printf(" -> {}", e.link::str); }
+            if (!e.complete)   { print.print("  [incomplete]"); }
+            print.println("");
+        }
+        or {
+            print.printf("        Name: {}\n", e.name::str);
+            if (e.h.redir_type != H.REDIR_NONE) {
+                print.printf("        Type: {}\n", redir_name(e.h.redir_type));
+                print.printf("      Target: {}\n", e.link::str);
+            }
+            or (AR.is_dir(e)) {
+                print.println("        Type: Directory");
+            }
+            or {
+                print.println("        Type: File");
+            }
+            if (!AR.is_dir(e)) {
+                print.printf("        Size: {}\n", e.h.unp_size);
+                print.printf(" Packed size: {}\n", packed);
+                print.printf("       Ratio: {}%\n", ratio(e.h.unp_size, packed));
+            }
+            print_time_line("       mtime", e.h.mtime);
+            print_time_line("       ctime", e.h.ctime);
+            print_time_line("       atime", e.h.atime);
+            print.printf("  Attributes: {} ({:x})\n", (?attr[0])::str, e.h.attr);
+            if ((e.h.flags & H.FHFL_CRC32) != 0 && !tweaked(e)) { print.printf("       CRC32: {:08X}\n", e.h.data_crc); }
+            if (e.h.has_blake2 && !tweaked(e)) {
+                print.print("     BLAKE2: ");
+                print_hex(?e.h.blake2[0], 32);
+                print.println("");
+            }
+            if (e.h.host_os == H.HOST_UNIX) { print.println("     Host OS: Unix"); }
+            or                              { print.println("     Host OS: Windows"); }
+            if (e.h.rar4) {
+                print.printf(" Compression: RAR {}.{}(v{}) -m{} -md={}k", e.h.unp_ver / 10, e.h.unp_ver % 10, e.h.unp_ver, e.h.method, e.h.dict_size / 1024);
+            }
+            or {
+                print.printf(" Compression: RAR 5.0(v{}) -m{} -md={}k", 50 + e.h.comp_version, e.h.method, e.h.dict_size / 1024);
+            }
+            if (e.h.solid) { print.print(" solid"); }
+            print.println("");
+            if (e.h.crypt.present) {
+                print.printf("  Encryption: AES-256, KDF 2^{}", e.h.crypt.kdf_count);
+                if ((e.h.crypt.flags & H.CRYPT_HASHMAC) != 0) { print.print(", tweaked checksums"); }
+                print.println("");
+            }
+            if (e.h.has_uid || e.h.user_name != nil) {
+                print.printf("       Owner: uid {} gid {}\n", e.h.uid, e.h.gid);
+            }
+            if (e.seg_count > 1 || !e.complete) {
+                print.printf("     Volumes: {} part(s)", e.seg_count);
+                if (!e.complete) { print.print(", incomplete"); }
+                print.println("");
+            }
+            if (!e.header_ok) { print.println("     Warning: header checksum mismatch"); }
+            print.println("");
+        }
+        i = i + 1;
+    }
+
+    if (!technical) {
+        print.println(" ----------  ---------- ---------- -----");
+        print.printf("             {:10} {:10} {:4}%  {} file(s)\n", total_unp, total_packed, ratio(total_unp, total_packed), files);
+    }
+    ret print_damage(ar);
+}

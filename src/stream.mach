@@ -1,0 +1,204 @@
+# byte streams between the archive and the unpacker
+#
+# Packed reads an entry's data area across all of its volume parts, checking
+# the CRC32 stored for every part but the last (that one covers the unpacked
+# data), and decrypting with AES-256-CBC when the entry is encrypted.
+#
+# Sink receives unpacked bytes, hashes them with CRC32 and, when the entry
+# has one, BLAKE2sp, and writes them to a file, to stdout or nowhere.
+
+use ramjet.crypto.crc32;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use AR: ramjet.archive;
+use ramjet.crypto.aes;
+use b2: ramjet.crypto.blake2;
+use E:  ramjet.errors;
+use M:  ramjet.mem;
+
+pub rec Packed {
+    ar:       *AR.Archive;
+    seg:      i64;
+    seg_off:  u64;
+    left:     u64;
+    part_crc: u32;
+    part_b2:  b2.Blake2sp;
+    part_bad: bool;
+
+    encrypted: bool;
+    key:       aes.Key;
+    iv:        [16]u8;
+    block:     [16]u8;
+    block_pos: usize;
+    block_len: usize;
+}
+
+pub fun packed_open(p: *Packed, ar: *AR.Archive, e: *AR.Entry) {
+    p.ar       = ar;
+    p.seg      = e.seg_first::i64;
+    p.seg_off  = 0;
+    p.left     = AR.segment(ar, e.seg_first).size;
+    p.part_crc = crc32.init();
+    b2.sp_init(?p.part_b2);
+    p.part_bad  = false;
+    p.encrypted = false;
+    p.block_pos = 0;
+    p.block_len = 0;
+}
+
+pub fun packed_encrypt(p: *Packed, key: *u8, iv: *u8) {
+    p.encrypted = true;
+    aes.init(?p.key, key);
+    M.copy(?p.iv[0], iv, 16);
+}
+
+# AES-128 data of RAR 2.9-4.x archives
+pub fun packed_encrypt128(p: *Packed, key: *u8, iv: *u8) {
+    p.encrypted = true;
+    aes.init128(?p.key, key);
+    M.copy(?p.iv[0], iv, 16);
+}
+
+# raw bytes from the current segments, advancing across volumes
+fun raw_read(p: *Packed, dst: *u8, n: usize) usize {
+    var done: usize = 0;
+    for (done < n) {
+        if (p.seg < 0) { ret done; }
+        val s: *AR.Segment = AR.segment(p.ar, p.seg::usize);
+        if (p.left == 0) {
+            # finished this part: verify its packed CRC unless it is the last
+            if (s.next >= 0 && s.has_crc && crc32.final(p.part_crc) != s.crc) { p.part_bad = true; }
+            if (s.next >= 0 && s.has_blake2) {
+                var d: [32]u8;
+                b2.sp_final(?p.part_b2, ?d[0]);
+                var k: usize = 0;
+                for (k < 32) {
+                    if (d[k] != s.blake2[k]) { p.part_bad = true; }
+                    k = k + 1;
+                }
+            }
+            p.seg      = s.next;
+            p.seg_off  = 0;
+            p.part_crc = crc32.init();
+            b2.sp_init(?p.part_b2);
+            if (p.seg >= 0) { p.left = AR.segment(p.ar, p.seg::usize).size; }
+            cnt;
+        }
+        val v:  *AR.Volume = AR.volume(p.ar, s.vol);
+        val at: u64        = s.offset + p.seg_off;
+        if (at >= v.size::u64) {
+            # data area runs past the end of a truncated volume
+            p.seg = -1;
+            ret done;
+        }
+        var take: u64 = (n - done)::u64;
+        if (take > p.left)           { take = p.left; }
+        if (at + take > v.size::u64) { take = v.size::u64 - at; }
+        M.copy(?dst[done], ?v.data[at::usize], take::usize);
+        p.part_crc = crc32.update(p.part_crc, ?dst[done], take::usize);
+        # only parts before the last carry a hash of their packed bytes
+        if (s.next >= 0 && s.has_blake2) { b2.sp_update(?p.part_b2, ?dst[done], take::usize); }
+        p.seg_off = p.seg_off + take;
+        p.left    = p.left - take;
+        done      = done + take::usize;
+    }
+    ret done;
+}
+
+# read up to n bytes of (decrypted) packed data; fewer means the data ended
+pub fun packed_read(p: *Packed, dst: *u8, n: usize) usize {
+    if (!p.encrypted) { ret raw_read(p, dst, n); }
+    var done: usize = 0;
+    for (done < n) {
+        if (p.block_pos == p.block_len) {
+            val got: usize = raw_read(p, ?p.block[0], 16);
+            if (got != 16) { ret done; }
+            aes.cbc_decrypt(?p.key, ?p.iv[0], ?p.block[0], 16);
+            p.block_pos = 0;
+            p.block_len = 16;
+        }
+        dst[done]   = p.block[p.block_pos];
+        p.block_pos = p.block_pos + 1;
+        done        = done + 1;
+    }
+    ret done;
+}
+
+# read every remaining byte so the per-part CRCs get checked
+pub fun packed_drain(p: *Packed) {
+    var tmp: [4096]u8;
+    for (raw_read(p, ?tmp[0], 4096) == 4096) {}
+}
+
+pub val SINK_DISCARD: u8 = 0;
+pub val SINK_FD:      u8 = 1;
+pub val SINK_MEMORY:  u8 = 2;
+
+pub rec Sink {
+    mode:       u8;
+    fd:         usize;
+    crc:        u32;
+    use_blake2: bool;
+    blake2:     b2.Blake2sp;
+    written:    u64;
+    failed:     bool;
+    mem:        *u8;
+    mem_cap:    usize;
+}
+
+pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
+    s.mode       = mode;
+    s.fd         = fd;
+    s.crc        = crc32.init();
+    s.use_blake2 = blake2;
+    if (blake2) { b2.sp_init(?s.blake2); }
+    s.written = 0;
+    s.failed  = false;
+    s.mem     = nil;
+    s.mem_cap = 0;
+}
+
+# collect up to cap bytes in memory; more than that marks the sink failed
+pub fun sink_memory(s: *Sink, buf: *u8, cap: usize) {
+    sink_init(s, SINK_MEMORY, 0, false);
+    s.mem     = buf;
+    s.mem_cap = cap;
+}
+
+pub fun sink_write(s: *Sink, p: *u8, n: usize) {
+    if (n == 0) { ret; }
+    s.crc = crc32.update(s.crc, p, n);
+    if (s.use_blake2) { b2.sp_update(?s.blake2, p, n); }
+    if (s.mode == SINK_MEMORY) {
+        if (s.written + n::u64 > s.mem_cap::u64) {
+            s.failed = true;
+        }
+        or {
+            M.copy(?s.mem[s.written::usize], p, n);
+        }
+    }
+    s.written = s.written + n::u64;
+    if (s.mode == SINK_FD && !s.failed) {
+        var off: usize = 0;
+        for (off < n) {
+            val w: i64 = os.write(s.fd, ?p[off], n - off);
+            if (w <= 0) {
+                s.failed = true;
+                ret;
+            }
+            off = off + w::usize;
+        }
+    }
+}
+
+pub fun sink_crc(s: *Sink) u32 {
+    ret crc32.final(s.crc);
+}
+
+pub fun sink_blake2(s: *Sink, out: *u8) {
+    b2.sp_final(?s.blake2, out);
+}

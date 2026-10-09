@@ -1,0 +1,104 @@
+# process-wide allocator
+#
+# Ramjet is a command-line tool with one thread doing the work, so a single
+# heap set up at start is shared by every module. allocation failure is
+# reported as nil and handled by the caller.
+
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.allocator.heap;
+
+var g_source: heap.Source;
+var g_heap:   heap.Heap;
+var g_alloc:  A.Allocator;
+var g_ready:  bool = false;
+
+# set up the heap; safe to call more than once
+pub fun init() bool {
+    if (g_ready) { ret true; }
+    heap.native_source(?g_source);
+    val hi: err[A.Error] = heap.init(?g_heap, ?g_source, 0);
+    if (sel hi.err) { ret false; }
+    val mk: err[A.Error] = heap.make(?g_alloc, ?g_heap);
+    if (sel mk.err) { ret false; }
+    g_ready = true;
+    ret true;
+}
+
+# the shared allocator, for std APIs that take one
+pub fun allocator() *A.Allocator {
+    init();
+    ret ?g_alloc;
+}
+
+# n bytes, zeroed, or nil
+pub fun alloc(n: usize) *u8 {
+    init();
+    var size: usize = n;
+    if (size == 0) { size = 1; }
+    val r: res[ptr, A.Error] = A.allocate_raw(?g_alloc, size, 16);
+    if (sel r.err) { ret nil; }
+    memory.raw_zero(r.ok, size);
+    ret r.ok::*u8;
+}
+
+# release a block from alloc
+pub fun free(p: *u8, n: usize) {
+    if (p == nil) { ret; }
+    var size: usize = n;
+    if (size == 0) { size = 1; }
+    A.deallocate_raw(?g_alloc, p::ptr, size, 16);
+}
+
+# copy n bytes between non-overlapping ranges
+pub fun copy(dst: *u8, src: *u8, n: usize) {
+    if (n > 0) { memory.raw_copy(dst::ptr, src::ptr, n); }
+}
+
+# copy n bytes between possibly overlapping ranges
+pub fun move(dst: *u8, src: *u8, n: usize) {
+    if (n > 0) { memory.raw_move(dst::ptr, src::ptr, n); }
+}
+
+# a NUL-terminated copy of n bytes, or nil
+pub fun dup(p: *u8, n: usize) *u8 {
+    val out: *u8 = alloc(n + 1);
+    if (out == nil) { ret nil; }
+    if (n > 0)      { memory.raw_copy(out::ptr, p::ptr, n); }
+    out[n] = 0;
+    ret out;
+}
+
+# length of a NUL-terminated byte string
+pub fun cstr_len(s: *u8) usize {
+    if (s == nil) { ret 0; }
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# true when two NUL-terminated byte strings are equal
+pub fun cstr_eq(a: *u8, b: *u8) bool {
+    var i: usize = 0;
+    for (a[i] == b[i]) {
+        if (a[i] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+test mem__alloc_dup {
+    val s: *u8 = dup("abc"::*u8, 3);
+    if (s == nil)                { ret 1; }
+    if (cstr_len(s) != 3)        { ret 2; }
+    if (!cstr_eq(s, "abc"::*u8)) { ret 3; }
+    free(s, 4);
+    ret 0;
+}

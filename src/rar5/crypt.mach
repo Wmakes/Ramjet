@@ -1,0 +1,107 @@
+# RAR5 key derivation and checksum tweaking
+#
+# the technote fixes the primitives (AES-256, PBKDF2 with 2^kdf_count
+# iterations, a 16-byte salt, a 12-byte password check) but leaves the exact
+# derivation to the UnRAR source, which Ramjet does not use. the scheme below
+# was confirmed black-box against archives made with the rar tool
+# (tests/samples/all_encrypted.rar and all_hdr_encrypted.rar):
+#
+#   key       = PBKDF2-HMAC-SHA256(password, salt, 2^kdf_count)
+#   hash key  = the same PBKDF2 block run 16 iterations further
+#   check     = run 16 iterations further again, XOR-folded to 8 bytes
+#   check sum = first 4 bytes of SHA-256(check)
+#
+# tweaked checksums (encryption flag 0x2) replace a CRC32 or BLAKE2sp value
+# with HMAC-SHA256(hash key, value); a CRC32 is then XOR-folded back to 4
+# bytes.
+
+use sha: std.crypto.hash.sha256;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use B: ramjet.bytes;
+use K: ramjet.crypto.kdf;
+
+# the largest kdf_count accepted; 2^24 iterations already take seconds
+pub val MAX_KDF_COUNT: u8 = 24;
+
+# values derived from one password and salt
+pub rec Keys {
+    key:      [32]u8;
+    hash_key: [32]u8;
+    check:    [8]u8;
+}
+
+pub fun derive(password: *u8, pw_len: usize, salt: *u8, kdf_count: u8, out: *Keys) bool {
+    if (kdf_count > MAX_KDF_COUNT) { ret false; }
+    var p: K.Pbkdf2;
+    K.pbkdf2_start(?p, password, pw_len, salt, 16);
+    val count: u64 = 1::u64 << kdf_count::u64;
+    K.pbkdf2_more(?p, count - 1);
+    var i: usize = 0;
+    for (i < 32) {
+        out.key[i] = p.acc[i];
+        i          = i + 1;
+    }
+    K.pbkdf2_more(?p, 16);
+    i = 0;
+    for (i < 32) {
+        out.hash_key[i] = p.acc[i];
+        i               = i + 1;
+    }
+    K.pbkdf2_more(?p, 16);
+    i = 0;
+    for (i < 8) {
+        out.check[i] = 0;
+        i            = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        out.check[i % 8] = out.check[i % 8] ^ p.acc[i];
+        i                = i + 1;
+    }
+    ret true;
+}
+
+# is the 12-byte stored check value itself intact (independent of password)
+pub fun check_value_intact(stored: *u8) bool {
+    var d: [32]u8;
+    sha.hash(stored, 8, ?d[0]);
+    ret d[0] == stored[8] && d[1] == stored[9] && d[2] == stored[10] && d[3] == stored[11];
+}
+
+# does the derived check match the stored one
+pub fun check_matches(k: *Keys, stored: *u8) bool {
+    var i: usize = 0;
+    for (i < 8) {
+        if (k.check[i] != stored[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# CRC32 as stored for an entry with tweaked checksums
+pub fun tweak_crc(k: *Keys, crc: u32) u32 {
+    var raw: [4]u8;
+    B.store_u32(?raw[0], crc);
+    var mac: [32]u8;
+    K.hmac_once(?k.hash_key[0], 32, ?raw[0], 4, ?mac[0]);
+    var folded: [4]u8;
+    folded[0] = 0;
+    folded[1] = 0;
+    folded[2] = 0;
+    folded[3] = 0;
+    var i: usize = 0;
+    for (i < 32) {
+        folded[i & 3] = folded[i & 3] ^ mac[i];
+        i             = i + 1;
+    }
+    ret B.load_u32(?folded[0]);
+}
+
+# BLAKE2sp digest as stored for an entry with tweaked checksums
+pub fun tweak_digest(k: *Keys, digest: *u8, out: *u8) {
+    K.hmac_once(?k.hash_key[0], 32, digest, 32, out);
+}

@@ -1,0 +1,1092 @@
+# PPMd variant H with the range coder RAR 2.9 uses
+#
+# PPMd var.H is Dmitry Shkarin's public-domain algorithm (2001); the model
+# below follows its published description and Igor Pavlov's public-domain
+# Ppmd7 formulation. RAR drives it with its own range decoder (low/range
+# with a 0x8000 bottom), set up here as well.
+#
+# the model lives in one byte heap addressed by 32-bit offsets (0 = none):
+#   context (12 bytes): num_stats u16, summ_freq u16, stats u32, suffix u32
+#   state   (6 bytes):  symbol u8, freq u8, successor u32 (as two u16)
+# a context with one state keeps that state in place of summ_freq + stats.
+# free blocks are 12-byte units on 38 size-class lists.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use M:  ramjet.mem;
+use BI: ramjet.rar4.bitin;
+
+val MAX_O:       u32   = 64;
+val UNIT:        u32   = 12;
+val NUM_INDEXES: usize = 38;
+val MAX_FREQ:    u32   = 124;
+val INT_BITS:    u32   = 7;
+val PERIOD_BITS: u32   = 7;
+val BIN_SCALE:   u32   = 0x4000;
+val TOP:         u32   = 0x1000000;
+val BOT:         u32   = 0x8000;
+
+# secondary escape estimation: summ, shift, count
+rec See {
+    summ:  u16;
+    shift: u8;
+    count: u8;
+}
+
+pub rec Model {
+    base:  *u8;
+    size:  u32;
+    align: u32;
+
+    min_ctx:      u32;
+    max_ctx:      u32;
+    found:        u32;
+    order_fall:   u32;
+    init_esc:     u32;
+    prev_success: u32;
+    max_order:    u32;
+    hi_bits_flag: u32;
+    run_length:   i32;
+    init_rl:      i32;
+    glue_count:   u32;
+
+    text:        u32;
+    units_start: u32;
+    lo_unit:     u32;
+    hi_unit:     u32;
+
+    indx2units: [38]u8;
+    units2indx: [128]u8;
+    free_list:  [38]u32;
+    ns2indx:    [256]u8;
+    ns2bsindx:  [256]u8;
+    hb2flag:    [256]u8;
+    dummy_see:  See;
+    see:        [400]See;
+    bin_summ:   [8192]u16;
+
+    # escape scratch: symbols already ruled out, and the candidate states
+    mask: [256]u8;
+    ps:   [256]u32;
+
+    # range decoder
+    low:    u32;
+    range:  u32;
+    code:   u32;
+    bottom: u32;
+    input:  *BI.BitIn;
+}
+
+# ---------------------------------------------------------------- heap access
+
+fun rd8(m: *Model, o: u32) u32 {
+    ret m.base[o::usize]::u32;
+}
+
+fun wr8(m: *Model, o: u32, v: u32) {
+    m.base[o::usize] = (v & 0xFF)::u8;
+}
+
+fun rd16(m: *Model, o: u32) u32 {
+    val p: *u8 = ?m.base[o::usize];
+    ret p[0]::u32 | (p[1]::u32 << 8);
+}
+
+fun wr16(m: *Model, o: u32, v: u32) {
+    val p: *u8 = ?m.base[o::usize];
+    p[0] = (v & 0xFF)::u8;
+    p[1] = ((v >> 8) & 0xFF)::u8;
+}
+
+fun rd32(m: *Model, o: u32) u32 {
+    val p: *u8 = ?m.base[o::usize];
+    ret p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24);
+}
+
+fun wr32(m: *Model, o: u32, v: u32) {
+    val p: *u8 = ?m.base[o::usize];
+    p[0] = (v & 0xFF)::u8;
+    p[1] = ((v >> 8) & 0xFF)::u8;
+    p[2] = ((v >> 16) & 0xFF)::u8;
+    p[3] = ((v >> 24) & 0xFF)::u8;
+}
+
+# context fields
+fun num_stats(m: *Model, c: u32) u32 {
+    ret rd16(m, c);
+}
+
+fun set_num_stats(m: *Model, c: u32, v: u32) {
+    wr16(m, c, v);
+}
+
+fun summ_freq(m: *Model, c: u32) u32 {
+    ret rd16(m, c + 2);
+}
+
+fun set_summ_freq(m: *Model, c: u32, v: u32) {
+    wr16(m, c + 2, v);
+}
+
+fun stats(m: *Model, c: u32) u32 {
+    ret rd32(m, c + 4);
+}
+
+fun set_stats(m: *Model, c: u32, v: u32) {
+    wr32(m, c + 4, v);
+}
+
+fun suffix(m: *Model, c: u32) u32 {
+    ret rd32(m, c + 8);
+}
+
+fun set_suffix(m: *Model, c: u32, v: u32) {
+    wr32(m, c + 8, v);
+}
+
+fun one_state(c: u32) u32 {
+    ret c + 2;
+}
+
+# state fields
+fun sym(m: *Model, s: u32) u32 {
+    ret rd8(m, s);
+}
+
+fun set_sym(m: *Model, s: u32, v: u32) {
+    wr8(m, s, v);
+}
+
+fun freq(m: *Model, s: u32) u32 {
+    ret rd8(m, s + 1);
+}
+
+fun set_freq(m: *Model, s: u32, v: u32) {
+    wr8(m, s + 1, v);
+}
+
+fun successor(m: *Model, s: u32) u32 {
+    ret rd16(m, s + 2) | (rd16(m, s + 4) << 16);
+}
+
+fun set_successor(m: *Model, s: u32, v: u32) {
+    wr16(m, s + 2, v & 0xFFFF);
+    wr16(m, s + 4, v >> 16);
+}
+
+fun copy_state(m: *Model, dst: u32, src: u32) {
+    var i: u32 = 0;
+    for (i < 6) {
+        wr8(m, dst + i, rd8(m, src + i));
+        i = i + 1;
+    }
+}
+
+fun swap_states(m: *Model, a: u32, b: u32) {
+    var i: u32 = 0;
+    for (i < 6) {
+        val t: u32 = rd8(m, a + i);
+        wr8(m, a + i, rd8(m, b + i));
+        wr8(m, b + i, t);
+        i = i + 1;
+    }
+}
+
+fun u2b(nu: u32) u32 {
+    ret nu * UNIT;
+}
+
+fun u2i(m: *Model, nu: u32) u32 {
+    ret m.units2indx[(nu - 1)::usize]::u32;
+}
+
+fun i2u(m: *Model, i: u32) u32 {
+    ret m.indx2units[i::usize]::u32;
+}
+
+# ---------------------------------------------------------------- setup
+
+pub fun construct(m: *Model) {
+    m.base     = nil;
+    m.size     = 0;
+    m.init_esc = 0;
+    var i: u32 = 0;
+    var k: u32 = 0;
+    for (i < NUM_INDEXES::u32) {
+        var step: u32 = (i >> 2) + 1;
+        if (i >= 12) { step = 4; }
+        for (step > 0) {
+            m.units2indx[k::usize] = i::u8;
+            k                      = k + 1;
+            step                   = step - 1;
+        }
+        m.indx2units[i::usize] = k::u8;
+        i                      = i + 1;
+    }
+    m.ns2bsindx[0] = 0;
+    m.ns2bsindx[1] = 2;
+    i              = 2;
+    for (i < 11) {
+        m.ns2bsindx[i::usize] = 4;
+        i                     = i + 1;
+    }
+    for (i < 256) {
+        m.ns2bsindx[i::usize] = 6;
+        i                     = i + 1;
+    }
+    i = 0;
+    for (i < 3) {
+        m.ns2indx[i::usize] = i::u8;
+        i                   = i + 1;
+    }
+    var mm: u32 = 3;
+    k = 1;
+    for (i < 256) {
+        m.ns2indx[i::usize] = mm::u8;
+        k                   = k - 1;
+        if (k == 0) {
+            mm = mm + 1;
+            k  = mm - 2;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 256) {
+        if (i < 0x40) { m.hb2flag[i::usize] = 0; }
+        or            { m.hb2flag[i::usize] = 8; }
+        i = i + 1;
+    }
+}
+
+# reserve the model heap; false when out of memory
+pub fun alloc(m: *Model, size: u32) bool {
+    if (m.base != nil && m.size == size) { ret true; }
+    if (size < UNIT)                     { ret false; }
+    free(m);
+    m.align = 4 - (size & 3);
+    m.base  = M.alloc((m.align + size + UNIT)::usize);
+    if (m.base == nil) { ret false; }
+    m.size = size;
+    ret true;
+}
+
+pub fun free(m: *Model) {
+    if (m.base != nil) { M.free(m.base, (m.align + m.size + UNIT)::usize); }
+    m.base = nil;
+    m.size = 0;
+}
+
+fun insert_node(m: *Model, node: u32, indx: u32) {
+    wr32(m, node, m.free_list[indx::usize]);
+    m.free_list[indx::usize] = node;
+}
+
+fun remove_node(m: *Model, indx: u32) u32 {
+    val node: u32 = m.free_list[indx::usize];
+    m.free_list[indx::usize] = rd32(m, node);
+    ret node;
+}
+
+fun split_block(m: *Model, ptr0: u32, old_indx: u32, new_indx: u32) {
+    val nu:  u32 = i2u(m, old_indx) - i2u(m, new_indx);
+    val ptr: u32 = ptr0 + u2b(i2u(m, new_indx));
+    var i:   u32 = u2i(m, nu);
+    if (i2u(m, i) != nu) {
+        i = i - 1;
+        val k: u32 = i2u(m, i);
+        insert_node(m, ptr + u2b(k), nu - k - 1);
+    }
+    insert_node(m, ptr, i);
+}
+
+# node fields used while gluing: stamp u16, nu u16, next u32, prev u32
+fun glue_free_blocks(m: *Model) {
+    val head: u32 = m.align + m.size;
+    var n:    u32 = head;
+    m.glue_count = 255;
+
+    # one doubly linked list of every free block
+    var i: u32 = 0;
+    for (i < NUM_INDEXES::u32) {
+        val nu:   u32 = i2u(m, i);
+        var next: u32 = m.free_list[i::usize];
+        m.free_list[i::usize] = 0;
+        for (next != 0) {
+            val node: u32 = next;
+            wr32(m, node + 4, n);
+            wr32(m, n + 8, next);
+            n    = next;
+            next = rd32(m, node);
+            wr16(m, node, 0);
+            wr16(m, node + 2, nu);
+        }
+        i = i + 1;
+    }
+    wr16(m, head, 1);
+    wr32(m, head + 4, n);
+    wr32(m, n + 8, head);
+    if (m.lo_unit != m.hi_unit) { wr16(m, m.lo_unit, 1); }
+
+    # merge each block with the free blocks right after it
+    for (n != head) {
+        val node: u32 = n;
+        var nu:   u32 = rd16(m, node + 2);
+        for {
+            val node2: u32 = node + nu * UNIT;
+            nu = nu + rd16(m, node2 + 2);
+            if (rd16(m, node2) != 0 || nu >= 0x10000) { brk; }
+            val prev2: u32 = rd32(m, node2 + 8);
+            val next2: u32 = rd32(m, node2 + 4);
+            wr32(m, prev2 + 4, next2);
+            wr32(m, next2 + 8, prev2);
+            wr16(m, node + 2, nu);
+        }
+        n = rd32(m, node + 4);
+    }
+
+    # back onto the size-class lists
+    n = rd32(m, head + 4);
+    for (n != head) {
+        var node: u32 = n;
+        val next: u32 = rd32(m, node + 4);
+        var nu:   u32 = rd16(m, node + 2);
+        for (nu > 128) {
+            insert_node(m, node, NUM_INDEXES::u32 - 1);
+            nu   = nu - 128;
+            node = node + 128 * UNIT;
+        }
+        var k: u32 = u2i(m, nu);
+        if (i2u(m, k) != nu) {
+            k = k - 1;
+            val kk: u32 = i2u(m, k);
+            insert_node(m, node + kk * UNIT, nu - kk - 1);
+        }
+        insert_node(m, node, k);
+        n = next;
+    }
+}
+
+fun alloc_units_rare(m: *Model, indx: u32) u32 {
+    if (m.glue_count == 0) {
+        glue_free_blocks(m);
+        if (m.free_list[indx::usize] != 0) { ret remove_node(m, indx); }
+    }
+    var i: u32 = indx;
+    for {
+        i = i + 1;
+        if (i == NUM_INDEXES::u32) {
+            val num_bytes: u32 = u2b(i2u(m, indx));
+            m.glue_count = m.glue_count - 1;
+            if (m.units_start - m.text > num_bytes) {
+                m.units_start = m.units_start - num_bytes;
+                ret m.units_start;
+            }
+            ret 0;
+        }
+        if (m.free_list[i::usize] != 0) { brk; }
+    }
+    val r: u32 = remove_node(m, i);
+    split_block(m, r, i, indx);
+    ret r;
+}
+
+fun alloc_units(m: *Model, indx: u32) u32 {
+    if (m.free_list[indx::usize] != 0) { ret remove_node(m, indx); }
+    val num_bytes: u32 = u2b(i2u(m, indx));
+    if (num_bytes <= m.hi_unit - m.lo_unit) {
+        val r: u32 = m.lo_unit;
+        m.lo_unit = m.lo_unit + num_bytes;
+        ret r;
+    }
+    ret alloc_units_rare(m, indx);
+}
+
+fun copy_units(m: *Model, dst: u32, src: u32, nu: u32) {
+    M.move(?m.base[dst::usize], ?m.base[src::usize], (nu * UNIT)::usize);
+}
+
+fun shrink_units(m: *Model, old_ptr: u32, old_nu: u32, new_nu: u32) u32 {
+    val i0: u32 = u2i(m, old_nu);
+    val i1: u32 = u2i(m, new_nu);
+    if (i0 == i1) { ret old_ptr; }
+    if (m.free_list[i1::usize] != 0) {
+        val ptr: u32 = remove_node(m, i1);
+        copy_units(m, ptr, old_ptr, new_nu);
+        insert_node(m, old_ptr, i0);
+        ret ptr;
+    }
+    split_block(m, old_ptr, i0, i1);
+    ret old_ptr;
+}
+
+fun restart_model(m: *Model) {
+    var i: u32 = 0;
+    for (i < NUM_INDEXES::u32) {
+        m.free_list[i::usize] = 0;
+        i                     = i + 1;
+    }
+    m.text        = m.align;
+    m.hi_unit     = m.text + m.size;
+    m.lo_unit     = m.hi_unit - m.size / 8 / UNIT * 7 * UNIT;
+    m.units_start = m.lo_unit;
+    m.glue_count  = 0;
+
+    m.order_fall = m.max_order;
+    var rl: u32 = m.max_order;
+    if (rl > 12) { rl = 12; }
+    m.init_rl      = 0 - rl::i32 - 1;
+    m.run_length   = m.init_rl;
+    m.prev_success = 0;
+
+    m.hi_unit = m.hi_unit - UNIT;
+    m.min_ctx = m.hi_unit;
+    m.max_ctx = m.hi_unit;
+    set_suffix(m, m.min_ctx, 0);
+    set_num_stats(m, m.min_ctx, 256);
+    set_summ_freq(m, m.min_ctx, 257);
+    m.found = m.lo_unit;
+    set_stats(m, m.min_ctx, m.lo_unit);
+    m.lo_unit = m.lo_unit + u2b(128);
+    i         = 0;
+    for (i < 256) {
+        val s: u32 = m.found + i * 6;
+        set_sym(m, s, i);
+        set_freq(m, s, 1);
+        set_successor(m, s, 0);
+        i = i + 1;
+    }
+
+    val init_bin_esc: [8]u32 = [8]u32{0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051};
+    i = 0;
+    for (i < 128) {
+        var k: u32 = 0;
+        for (k < 8) {
+            val v: u32 = BIN_SCALE - init_bin_esc[k::usize] / (i + 2);
+            var j: u32 = 0;
+            for (j < 64) {
+                m.bin_summ[(i * 64 + k + j)::usize] = v::u16;
+                j                                   = j + 8;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 25) {
+        var k: u32 = 0;
+        for (k < 16) {
+            val s: *See = ?m.see[(i * 16 + k)::usize];
+            s.shift = (PERIOD_BITS - 4)::u8;
+            s.summ  = ((5 * i + 10) << s.shift::u32)::u16;
+            s.count = 4;
+            k       = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# start a fresh model of the given order
+pub fun init(m: *Model, max_order: u32) {
+    m.max_order = max_order;
+    restart_model(m);
+    m.dummy_see.shift = PERIOD_BITS::u8;
+    m.dummy_see.summ  = 0;
+    m.dummy_see.count = 64;
+}
+
+pub fun set_init_esc(m: *Model, v: u32) {
+    m.init_esc = v;
+}
+
+# ---------------------------------------------------------------- model update
+
+fun create_successors(m: *Model, skip: bool) u32 {
+    var c:         u32 = m.min_ctx;
+    val up_branch: u32 = successor(m, m.found);
+    var ps:        [64]u32;
+    var num_ps:    u32 = 0;
+    if (!skip) {
+        ps[0]  = m.found;
+        num_ps = 1;
+    }
+    val fsym: u32 = sym(m, m.found);
+    for (suffix(m, c) != 0) {
+        c = suffix(m, c);
+        var s: u32 = 0;
+        if (num_stats(m, c) != 1) {
+            s = stats(m, c);
+            for (sym(m, s) != fsym) { s = s + 6; }
+        }
+        or {
+            s = one_state(c);
+        }
+        val succ: u32 = successor(m, s);
+        if (succ != up_branch) {
+            c = succ;
+            if (num_ps == 0) { ret c; }
+            brk;
+        }
+        if (num_ps >= MAX_O) { ret 0; }
+        ps[num_ps::usize] = s;
+        num_ps            = num_ps + 1;
+    }
+
+    var up_sym:  u32 = rd8(m, up_branch);
+    var up_freq: u32 = 0;
+    val up_succ: u32 = up_branch + 1;
+    if (num_stats(m, c) == 1) {
+        up_freq = freq(m, one_state(c));
+    }
+    or {
+        var s: u32 = stats(m, c);
+        for (sym(m, s) != up_sym) { s = s + 6; }
+        val cf:  u32 = freq(m, s) - 1;
+        val s0:  u32 = summ_freq(m, c) - num_stats(m, c) - cf;
+        var add: u32 = 0;
+        if (2 * cf <= s0) {
+            if (5 * cf > s0) { add = 1; }
+        }
+        or {
+            add = (2 * cf + 3 * s0 - 1) / (2 * s0);
+        }
+        up_freq = 1 + add;
+    }
+
+    for (num_ps != 0) {
+        var c1: u32 = 0;
+        if (m.hi_unit != m.lo_unit) {
+            m.hi_unit = m.hi_unit - UNIT;
+            c1        = m.hi_unit;
+        }
+        or (m.free_list[0] != 0) {
+            c1 = remove_node(m, 0);
+        }
+        or {
+            c1 = alloc_units_rare(m, 0);
+            if (c1 == 0) { ret 0; }
+        }
+        set_num_stats(m, c1, 1);
+        val os: u32 = one_state(c1);
+        set_sym(m, os, up_sym);
+        set_freq(m, os, up_freq);
+        set_successor(m, os, up_succ);
+        set_suffix(m, c1, c);
+        num_ps = num_ps - 1;
+        set_successor(m, ps[num_ps::usize], c1);
+        c = c1;
+    }
+    up_sym = up_sym;
+    ret c;
+}
+
+fun update_model(m: *Model) {
+    var f_succ: u32 = successor(m, m.found);
+    val fsym:   u32 = sym(m, m.found);
+    val ffreq:  u32 = freq(m, m.found);
+
+    if (ffreq < MAX_FREQ / 4 && suffix(m, m.min_ctx) != 0) {
+        val c: u32 = suffix(m, m.min_ctx);
+        if (num_stats(m, c) == 1) {
+            val s: u32 = one_state(c);
+            if (freq(m, s) < 32) { set_freq(m, s, freq(m, s) + 1); }
+        }
+        or {
+            var s: u32 = stats(m, c);
+            if (sym(m, s) != fsym) {
+                s = s + 6;
+                for (sym(m, s) != fsym) { s = s + 6; }
+                if (freq(m, s) >= freq(m, s - 6)) {
+                    swap_states(m, s, s - 6);
+                    s = s - 6;
+                }
+            }
+            if (freq(m, s) < MAX_FREQ - 9) {
+                set_freq(m, s, freq(m, s) + 2);
+                set_summ_freq(m, c, summ_freq(m, c) + 2);
+            }
+        }
+    }
+
+    if (m.order_fall == 0) {
+        m.min_ctx = create_successors(m, true);
+        m.max_ctx = m.min_ctx;
+        if (m.min_ctx == 0) {
+            restart_model(m);
+            ret;
+        }
+        set_successor(m, m.found, m.min_ctx);
+        ret;
+    }
+
+    wr8(m, m.text, fsym);
+    m.text = m.text + 1;
+    var succ: u32 = m.text;
+    if (m.text >= m.units_start) {
+        restart_model(m);
+        ret;
+    }
+
+    if (f_succ != 0) {
+        if (f_succ <= succ) {
+            val cs: u32 = create_successors(m, false);
+            if (cs == 0) {
+                restart_model(m);
+                ret;
+            }
+            f_succ = cs;
+        }
+        m.order_fall = m.order_fall - 1;
+        if (m.order_fall == 0) {
+            succ = f_succ;
+            if (m.max_ctx != m.min_ctx) { m.text = m.text - 1; }
+        }
+    }
+    or {
+        set_successor(m, m.found, succ);
+        f_succ = m.min_ctx;
+    }
+
+    val ns: u32 = num_stats(m, m.min_ctx);
+    val s0: u32 = summ_freq(m, m.min_ctx) - ns - (ffreq - 1);
+
+    var c: u32 = m.max_ctx;
+    for (c != m.min_ctx) {
+        val ns1: u32 = num_stats(m, c);
+        if (ns1 != 1) {
+            if ((ns1 & 1) == 0) {
+                val old_nu: u32 = ns1 >> 1;
+                val i:      u32 = u2i(m, old_nu);
+                if (i != u2i(m, old_nu + 1)) {
+                    val ptr: u32 = alloc_units(m, i + 1);
+                    if (ptr == 0) {
+                        restart_model(m);
+                        ret;
+                    }
+                    val old_ptr: u32 = stats(m, c);
+                    copy_units(m, ptr, old_ptr, old_nu);
+                    insert_node(m, old_ptr, i);
+                    set_stats(m, c, ptr);
+                }
+            }
+            var sf: u32 = summ_freq(m, c);
+            if (2 * ns1 < ns)                                { sf = sf + 1; }
+            if (4 * ns1 <= ns && summ_freq(m, c) <= 8 * ns1) { sf = sf + 2; }
+            set_summ_freq(m, c, sf);
+        }
+        or {
+            val s: u32 = alloc_units(m, 0);
+            if (s == 0) {
+                restart_model(m);
+                ret;
+            }
+            copy_state(m, s, one_state(c));
+            set_stats(m, c, s);
+            if (freq(m, s) < MAX_FREQ / 4 - 1) {
+                set_freq(m, s, freq(m, s) << 1);
+            }
+            or {
+                set_freq(m, s, MAX_FREQ - 4);
+            }
+            var sf: u32 = freq(m, s) + m.init_esc;
+            if (ns > 3) { sf = sf + 1; }
+            set_summ_freq(m, c, sf);
+        }
+        var cf: u32 = 2 * ffreq * (summ_freq(m, c) + 6);
+        val sf: u32 = s0 + summ_freq(m, c);
+        if (cf < 6 * sf) {
+            var v: u32 = 1;
+            if (cf > sf)      { v = v + 1; }
+            if (cf >= 4 * sf) { v = v + 1; }
+            cf = v;
+            set_summ_freq(m, c, summ_freq(m, c) + 3);
+        }
+        or {
+            var v: u32 = 4;
+            if (cf >= 9 * sf)  { v = v + 1; }
+            if (cf >= 12 * sf) { v = v + 1; }
+            if (cf >= 15 * sf) { v = v + 1; }
+            cf = v;
+            set_summ_freq(m, c, summ_freq(m, c) + cf);
+        }
+        val ns_new: u32 = stats(m, c) + ns1 * 6;
+        set_successor(m, ns_new, succ);
+        set_sym(m, ns_new, fsym);
+        set_freq(m, ns_new, cf);
+        set_num_stats(m, c, ns1 + 1);
+        c = suffix(m, c);
+    }
+    m.max_ctx = f_succ;
+    m.min_ctx = f_succ;
+}
+
+fun rescale(m: *Model) {
+    val st: u32 = stats(m, m.min_ctx);
+    var s:  u32 = m.found;
+    # move the found state to the front
+    var tmp: [6]u8;
+    var k:   u32 = 0;
+    for (k < 6) {
+        tmp[k::usize] = m.base[(s + k)::usize];
+        k             = k + 1;
+    }
+    for (s != st) {
+        copy_state(m, s, s - 6);
+        s = s - 6;
+    }
+    k = 0;
+    for (k < 6) {
+        m.base[(s + k)::usize] = tmp[k::usize];
+        k                      = k + 1;
+    }
+
+    var esc_freq: u32 = summ_freq(m, m.min_ctx) - freq(m, s);
+    set_freq(m, s, freq(m, s) + 4);
+    var adder: u32 = 0;
+    if (m.order_fall != 0) { adder = 1; }
+    set_freq(m, s, (freq(m, s) + adder) >> 1);
+    var sum_freq: u32 = freq(m, s);
+
+    var i: u32 = num_stats(m, m.min_ctx) - 1;
+    for {
+        s        = s + 6;
+        esc_freq = esc_freq - freq(m, s);
+        set_freq(m, s, (freq(m, s) + adder) >> 1);
+        sum_freq = sum_freq + freq(m, s);
+        if (freq(m, s) > freq(m, s - 6)) {
+            var s1: u32 = s;
+            k = 0;
+            for (k < 6) {
+                tmp[k::usize] = m.base[(s1 + k)::usize];
+                k             = k + 1;
+            }
+            val tfreq: u32 = tmp[1]::u32;
+            for {
+                copy_state(m, s1, s1 - 6);
+                s1 = s1 - 6;
+                if (s1 == st || tfreq <= freq(m, s1 - 6)) { brk; }
+            }
+            k = 0;
+            for (k < 6) {
+                m.base[(s1 + k)::usize] = tmp[k::usize];
+                k                       = k + 1;
+            }
+        }
+        i = i - 1;
+        if (i == 0) { brk; }
+    }
+
+    if (freq(m, s) == 0) {
+        val num_stats0: u32 = num_stats(m, m.min_ctx);
+        var zeros:      u32 = 0;
+        for {
+            zeros = zeros + 1;
+            s     = s - 6;
+            if (freq(m, s) != 0) { brk; }
+        }
+        esc_freq = esc_freq + zeros;
+        set_num_stats(m, m.min_ctx, num_stats(m, m.min_ctx) - zeros);
+        if (num_stats(m, m.min_ctx) == 1) {
+            k = 0;
+            for (k < 6) {
+                tmp[k::usize] = m.base[(st + k)::usize];
+                k             = k + 1;
+            }
+            var tf: u32 = tmp[1]::u32;
+            for {
+                tf       = tf - (tf >> 1);
+                esc_freq = esc_freq >> 1;
+                if (esc_freq <= 1) { brk; }
+            }
+            tmp[1] = tf::u8;
+            insert_node(m, st, u2i(m, (num_stats0 + 1) >> 1));
+            m.found = one_state(m.min_ctx);
+            k       = 0;
+            for (k < 6) {
+                m.base[(m.found + k)::usize] = tmp[k::usize];
+                k                            = k + 1;
+            }
+            ret;
+        }
+        val n0: u32 = (num_stats0 + 1) >> 1;
+        val n1: u32 = (num_stats(m, m.min_ctx) + 1) >> 1;
+        if (n0 != n1) { set_stats(m, m.min_ctx, shrink_units(m, st, n0, n1)); }
+    }
+    set_summ_freq(m, m.min_ctx, sum_freq + esc_freq - (esc_freq >> 1));
+    m.found = stats(m, m.min_ctx);
+}
+
+fun make_esc_freq(m: *Model, num_masked: u32, esc_freq: *u32) *See {
+    val ns:         u32 = num_stats(m, m.min_ctx);
+    val non_masked: u32 = ns - num_masked;
+    if (ns != 256) {
+        var idx: u32 = m.ns2indx[(non_masked - 1)::usize]::u32 * 16;
+        if (non_masked < num_stats(m, suffix(m, m.min_ctx)) - ns) { idx = idx + 1; }
+        if (summ_freq(m, m.min_ctx) < 11 * ns)                    { idx = idx + 2; }
+        if (num_masked > non_masked)                              { idx = idx + 4; }
+        idx = idx + m.hi_bits_flag;
+        val see: *See = ?m.see[idx::usize];
+        val r:   u32  = see.summ::u32 >> see.shift::u32;
+        see.summ = (see.summ::u32 - r)::u16;
+        var e: u32 = r;
+        if (r == 0) { e = 1; }
+        @esc_freq = e;
+        ret see;
+    }
+    @esc_freq = 1;
+    ret ?m.dummy_see;
+}
+
+fun next_context(m: *Model) {
+    val c: u32 = successor(m, m.found);
+    if (m.order_fall == 0 && c > m.text) {
+        m.min_ctx = c;
+        m.max_ctx = c;
+    }
+    or {
+        update_model(m);
+    }
+}
+
+fun update1(m: *Model) {
+    var s: u32 = m.found;
+    set_freq(m, s, freq(m, s) + 4);
+    set_summ_freq(m, m.min_ctx, summ_freq(m, m.min_ctx) + 4);
+    if (freq(m, s) > freq(m, s - 6)) {
+        swap_states(m, s, s - 6);
+        s       = s - 6;
+        m.found = s;
+        if (freq(m, s) > MAX_FREQ) { rescale(m); }
+    }
+    next_context(m);
+}
+
+fun update1_0(m: *Model) {
+    m.prev_success = 0;
+    if (2 * freq(m, m.found) > summ_freq(m, m.min_ctx)) { m.prev_success = 1; }
+    m.run_length = m.run_length + m.prev_success::i32;
+    set_summ_freq(m, m.min_ctx, summ_freq(m, m.min_ctx) + 4);
+    set_freq(m, m.found, freq(m, m.found) + 4);
+    if (freq(m, m.found) > MAX_FREQ) { rescale(m); }
+    next_context(m);
+}
+
+fun update_bin(m: *Model) {
+    if (freq(m, m.found) < 128) { set_freq(m, m.found, freq(m, m.found) + 1); }
+    m.prev_success = 1;
+    m.run_length   = m.run_length + 1;
+    next_context(m);
+}
+
+fun update2(m: *Model) {
+    set_summ_freq(m, m.min_ctx, summ_freq(m, m.min_ctx) + 4);
+    set_freq(m, m.found, freq(m, m.found) + 4);
+    if (freq(m, m.found) > MAX_FREQ) { rescale(m); }
+    m.run_length = m.init_rl;
+    update_model(m);
+}
+
+fun see_update(s: *See) {
+    if (s.shift::u32 < PERIOD_BITS) {
+        s.count = s.count - 1;
+        if (s.count == 0) {
+            s.summ  = (s.summ::u32 << 1)::u16;
+            s.count = (3::u32 << s.shift::u32)::u8;
+            s.shift = s.shift + 1;
+        }
+    }
+}
+
+# ---------------------------------------------------------------- range decoder
+
+# start the decoder on the next 4 input bytes
+pub fun range_init(m: *Model, input: *BI.BitIn) bool {
+    m.input  = input;
+    m.low    = 0;
+    m.bottom = 0;
+    m.range  = 0xFFFFFFFF;
+    m.code   = 0;
+    var i: u32 = 0;
+    for (i < 4) {
+        m.code = (m.code << 8) | BI.byte(input)::u32;
+        i      = i + 1;
+    }
+    m.bottom = BOT;
+    ret m.code < 0xFFFFFFFF;
+}
+
+fun threshold(m: *Model, total: u32) u32 {
+    # a corrupt stream can shrink the range below the total; answer with a
+    # count no symbol matches, which the decoder reports as damage
+    if (total == 0 || m.range / total == 0) {
+        m.range = 1;
+        ret 0xFFFFFFFF;
+    }
+    m.range = m.range / total;
+    ret (m.code - m.low) / m.range;
+}
+
+fun normalize(m: *Model) {
+    for {
+        if ((m.low ^ (m.low + m.range)) >= TOP) {
+            if (m.range >= m.bottom) { brk; }
+            m.range = (0 - m.low) & (m.bottom - 1);
+        }
+        m.code  = (m.code << 8) | BI.byte(m.input)::u32;
+        m.range = m.range << 8;
+        m.low   = m.low << 8;
+    }
+}
+
+fun rc_decode(m: *Model, start: u32, size: u32) {
+    m.low   = m.low + start * m.range;
+    m.range = m.range * size;
+    normalize(m);
+}
+
+fun rc_bit(m: *Model, size0: u32) u32 {
+    val v: u32 = threshold(m, BIN_SCALE);
+    if (v < size0) {
+        rc_decode(m, 0, size0);
+        ret 0;
+    }
+    rc_decode(m, size0, BIN_SCALE - size0);
+    ret 1;
+}
+
+# ---------------------------------------------------------------- decoding
+
+fun get_mean(prob: u32) u32 {
+    ret (prob + (1::u32 << (PERIOD_BITS - 2))) >> PERIOD_BITS;
+}
+
+# one decoded byte, -1 for the end marker, -2 for corrupt data
+pub fun decode_symbol(m: *Model) i32 {
+    val mask: *u8 = ?m.mask[0];
+    val ns:   u32 = num_stats(m, m.min_ctx);
+    if (ns != 1) {
+        var s:      u32 = stats(m, m.min_ctx);
+        val count:  u32 = threshold(m, summ_freq(m, m.min_ctx));
+        var hi_cnt: u32 = freq(m, s);
+        if (count < hi_cnt) {
+            rc_decode(m, 0, freq(m, s));
+            m.found = s;
+            val r: u32 = sym(m, s);
+            update1_0(m);
+            ret r::i32;
+        }
+        m.prev_success = 0;
+        var i: u32 = ns - 1;
+        for {
+            s      = s + 6;
+            hi_cnt = hi_cnt + freq(m, s);
+            if (hi_cnt > count) {
+                rc_decode(m, hi_cnt - freq(m, s), freq(m, s));
+                m.found = s;
+                val r: u32 = sym(m, s);
+                update1(m);
+                ret r::i32;
+            }
+            i = i - 1;
+            if (i == 0) { brk; }
+        }
+        if (count >= summ_freq(m, m.min_ctx)) { ret -2; }
+        m.hi_bits_flag = m.hb2flag[sym(m, m.found)::usize]::u32;
+        rc_decode(m, hi_cnt, summ_freq(m, m.min_ctx) - hi_cnt);
+        var k: usize = 0;
+        for (k < 256) {
+            mask[k] = 0xFF;
+            k       = k + 1;
+        }
+        mask[sym(m, s)::usize] = 0;
+        i                      = ns - 1;
+        for {
+            s                      = s - 6;
+            mask[sym(m, s)::usize] = 0;
+            i                      = i - 1;
+            if (i == 0) { brk; }
+        }
+    }
+    or {
+        val os: u32 = one_state(m.min_ctx);
+        m.hi_bits_flag = m.hb2flag[sym(m, m.found)::usize]::u32;
+        var idx: u32 = (freq(m, os) - 1) * 64;
+        idx = idx + m.prev_success;
+        idx = idx + m.ns2bsindx[(num_stats(m, suffix(m, m.min_ctx)) - 1)::usize]::u32;
+        idx = idx + m.hi_bits_flag;
+        idx = idx + 2 * m.hb2flag[sym(m, os)::usize]::u32;
+        idx = idx + ((m.run_length >> 26) & 0x20)::u32;
+        val prob: u32 = m.bin_summ[idx::usize]::u32;
+        if (rc_bit(m, prob) == 0) {
+            m.bin_summ[idx::usize] = (prob + (1::u32 << INT_BITS) - get_mean(prob))::u16;
+            m.found                = os;
+            val r: u32 = sym(m, os);
+            update_bin(m);
+            ret r::i32;
+        }
+        val np: u32 = prob - get_mean(prob);
+        m.bin_summ[idx::usize] = np::u16;
+        val exp_escape: [16]u32 = [16]u32{25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2};
+        m.init_esc = exp_escape[(np >> 10)::usize];
+        var k: usize = 0;
+        for (k < 256) {
+            mask[k] = 0xFF;
+            k       = k + 1;
+        }
+        mask[sym(m, os)::usize] = 0;
+        m.prev_success          = 0;
+    }
+
+    val ps: *u32 = ?m.ps[0];
+    for {
+        val num_masked: u32 = num_stats(m, m.min_ctx);
+        for {
+            m.order_fall = m.order_fall + 1;
+            if (suffix(m, m.min_ctx) == 0) { ret -1; }
+            m.min_ctx = suffix(m, m.min_ctx);
+            if (num_stats(m, m.min_ctx) != num_masked) { brk; }
+        }
+        var hi_cnt: u32 = 0;
+        var s:      u32 = stats(m, m.min_ctx);
+        var i:      u32 = 0;
+        val num:    u32 = num_stats(m, m.min_ctx) - num_masked;
+        for (i != num) {
+            if (mask[sym(m, s)::usize] != 0) {
+                hi_cnt       = hi_cnt + freq(m, s);
+                ps[i::usize] = s;
+                i            = i + 1;
+            }
+            s = s + 6;
+        }
+        var freq_sum: u32  = 0;
+        val see:      *See = make_esc_freq(m, num_masked, ?freq_sum);
+        freq_sum = freq_sum + hi_cnt;
+        val count: u32 = threshold(m, freq_sum);
+        if (count < hi_cnt) {
+            var k:   usize = 0;
+            var acc: u32   = 0;
+            for {
+                acc = acc + freq(m, ps[k]);
+                if (acc > count) { brk; }
+                k = k + 1;
+            }
+            s = ps[k];
+            rc_decode(m, acc - freq(m, s), freq(m, s));
+            see_update(see);
+            m.found = s;
+            val r: u32 = sym(m, s);
+            update2(m);
+            ret r::i32;
+        }
+        if (count >= freq_sum) { ret -2; }
+        rc_decode(m, hi_cnt, freq_sum - hi_cnt);
+        see.summ = (see.summ::u32 + freq_sum)::u16;
+        for (i != 0) {
+            i                                 = i - 1;
+            mask[sym(m, ps[i::usize])::usize] = 0;
+        }
+    }
+    ret -2;
+}

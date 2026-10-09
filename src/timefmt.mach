@@ -1,0 +1,54 @@
+# calendar dates from Unix time, UTC
+#
+# days-to-civil conversion over the proleptic Gregorian calendar, using
+# 400-year eras so it is exact for any 64-bit day count.
+
+pub rec Civil {
+    year:   i64;
+    month:  u32;
+    day:    u32;
+    hour:   u32;
+    minute: u32;
+    second: u32;
+}
+
+pub fun civil(sec: i64) Civil {
+    var days: i64 = sec / 86400;
+    var rem:  i64 = sec % 86400;
+    if (rem < 0) {
+        rem  = rem + 86400;
+        days = days - 1;
+    }
+    val z:   i64 = days + 719468;
+    var era: i64 = z / 146097;
+    if (z < 0 && z % 146097 != 0) { era = era - 1; }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp:  i64 = (5 * doy + 2) / 153;
+    val d:   i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m:   i64 = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    var y: i64 = yoe + era * 400;
+    if (m <= 2) { y = y + 1; }
+    ret Civil{
+        year:   y,
+        month:  m::u32,
+        day:    d::u32,
+        hour:   (rem / 3600)::u32,
+        minute: ((rem % 3600) / 60)::u32,
+        second: (rem % 60)::u32,
+    };
+}
+
+test timefmt__known_dates {
+    val a: Civil = civil(0);
+    if (a.year != 1970 || a.month != 1 || a.day != 1) { ret 1; }
+    # 2001-02-03 04:05:06 UTC
+    val b: Civil = civil(981173106);
+    if (b.year != 2001 || b.month != 2 || b.day != 3 || b.hour != 4 || b.minute != 5 || b.second != 6) { ret 2; }
+    # 2000-02-29, a leap day
+    val c: Civil = civil(951782400);
+    if (c.year != 2000 || c.month != 2 || c.day != 29) { ret 3; }
+    ret 0;
+}

@@ -1,0 +1,751 @@
+# the t, x, e and p commands
+#
+# entries are processed in archive order, because a solid archive can only be
+# decoded front to back: an entry that is not selected is still decoded, into
+# a sink that discards it, whenever a later solid entry depends on it.
+#
+# archived names are made safe before anything is created: absolute paths
+# lose their root, "." components are dropped and any ".." component refuses
+# the entry. symbolic links are created only after every file is written, so
+# no file is ever written through a link that came from the archive.
+
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use V: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+
+use AR: ramjet.archive;
+use E:  ramjet.errors;
+use M:  ramjet.mem;
+use P:  ramjet.platform;
+use C4: ramjet.rar4.crypt;
+use U4: ramjet.rar4.unpack;
+use C:  ramjet.rar5.crypt;
+use H:  ramjet.rar5.header;
+use U:  ramjet.rar5.unpack;
+use S:  ramjet.stream;
+
+pub val MODE_TEST:    u8 = 0;
+pub val MODE_EXTRACT: u8 = 1;
+pub val MODE_FLAT:    u8 = 2;
+pub val MODE_PRINT:   u8 = 3;
+
+pub val OVERWRITE_SKIP: u8 = 0;
+pub val OVERWRITE_ALL:  u8 = 1;
+
+pub rec Options {
+    mode:      u8;
+    dest:      *u8;
+    overwrite: u8;
+    names:     **u8;
+    nnames:    usize;
+    quiet:     bool;
+    versions:  bool;
+}
+
+# a link to create once all files exist
+rec Deferred {
+    path:   *u8;
+    target: *u8;
+    entry:  usize;
+}
+
+rec State {
+    ar:   *AR.Archive;
+    opt:  *Options;
+    unp:  U.Unpacker;
+    unp4: U4.Unpacker;
+
+    # cached key for the last salt seen
+    key_valid: bool;
+    key_salt:  [16]u8;
+    key_kdf:   u8;
+    keys:      C.Keys;
+
+    key4_valid: bool;
+    key4_salt:  [8]u8;
+    keys4:      C4.Keys;
+
+    links:  Vector[Deferred];
+    dirs:   Vector[Deferred];
+    errors: usize;
+    done:   usize;
+}
+
+# ---------------------------------------------------------------- names
+
+fun matches(pattern: *u8, name: *u8) bool {
+    # '*' matches any run, '?' one byte; a pattern also selects everything
+    # under a directory of that name
+    var p:      usize = 0;
+    var n:      usize = 0;
+    var star_p: i64   = -1;
+    var star_n: usize = 0;
+    for {
+        if (pattern[p] == 0) {
+            if (name[n] == 0 || name[n] == '/') { ret true; }
+        }
+        or (pattern[p] == '*') {
+            star_p = p::i64;
+            star_n = n;
+            p      = p + 1;
+            cnt;
+        }
+        or (name[n] != 0 && (pattern[p] == '?' || pattern[p] == name[n])) {
+            p = p + 1;
+            n = n + 1;
+            cnt;
+        }
+        if (star_p < 0 || name[star_n] == 0) { ret false; }
+        star_n = star_n + 1;
+        n      = star_n;
+        p      = (star_p + 1)::usize;
+    }
+    ret false;
+}
+
+fun selected(st: *State, e: *AR.Entry) bool {
+    if (st.opt.nnames == 0) { ret true; }
+    var i: usize = 0;
+    for (i < st.opt.nnames) {
+        if (matches(st.opt.names[i], e.name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# does this byte separate path components on the system we extract on
+fun is_separator(c: u8) bool {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret c == '/' || c == '\\';
+    }
+    $or {
+        ret c == '/';
+    }
+}
+
+# Windows device names are reserved with any extension: CON, PRN, AUX, NUL,
+# COM1-9, LPT1-9
+fun reserved_device(p: *u8, len: usize) bool {
+    var base: usize = 0;
+    for (base < len && p[base] != '.') { base = base + 1; }
+    var up: [4]u8;
+    var i:  usize = 0;
+    for (i < 4 && i < base) {
+        var c: u8 = p[i];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        up[i] = c;
+        i     = i + 1;
+    }
+    if (base == 3) {
+        if (up[0] == 'C' && up[1] == 'O' && up[2] == 'N') { ret true; }
+        if (up[0] == 'P' && up[1] == 'R' && up[2] == 'N') { ret true; }
+        if (up[0] == 'A' && up[1] == 'U' && up[2] == 'X') { ret true; }
+        if (up[0] == 'N' && up[1] == 'U' && up[2] == 'L') { ret true; }
+    }
+    if (base == 4 && up[3] >= '1' && up[3] <= '9') {
+        if (up[0] == 'C' && up[1] == 'O' && up[2] == 'M') { ret true; }
+        if (up[0] == 'L' && up[1] == 'P' && up[2] == 'T') { ret true; }
+    }
+    ret false;
+}
+
+# a relative, normalized path for an archived name, or nil when unsafe
+#
+# components are split on every separator of the extracting system, so a
+# backslash in a Unix name cannot climb out on Windows. on Windows, trailing
+# dots and spaces (which Windows drops, turning ".. " into "..") and the
+# characters :*?"<>| are replaced, and device names get a leading '_'.
+# ---
+# flat: keep only the last component
+fun safe_name(e: *AR.Entry, flat: bool) *u8 {
+    val src: *u8   = e.name;
+    val n:   usize = M.cstr_len(src);
+    val out: *u8   = M.alloc(n + 2 * (n / 2 + 1) + 1);
+    if (out == nil) { ret nil; }
+    var o: usize = 0;
+    var i: usize = 0;
+    # a Windows drive prefix is dropped like a root
+    if (n >= 2 && src[1] == ':') { i = 2; }
+    for (i < n) {
+        # one component [i, j)
+        var j: usize = i;
+        for (j < n && !is_separator(src[j]) && src[j] != '/') { j = j + 1; }
+        if (j - i == 2 && src[i] == '.' && src[i + 1] == '.') {
+            M.free(out, n + 2 * (n / 2 + 1) + 1);
+            ret nil;
+        }
+        var end: usize = j;
+        $if ($mach.build.os == $mach.os.windows) {
+            for (end > i && (src[end - 1] == '.' || src[end - 1] == ' ')) { end = end - 1; }
+            # only dots and spaces: Windows would resolve it to "." or ".."
+            if (end == i && j > i && !(j - i == 1 && src[i] == '.')) {
+                M.free(out, n + 2 * (n / 2 + 1) + 1);
+                ret nil;
+            }
+        }
+        val len: usize = end - i;
+        if (len > 0 && !(len == 1 && src[i] == '.')) {
+            if (flat) { o = 0; }
+            if (o > 0) {
+                out[o] = '/';
+                o      = o + 1;
+            }
+            $if ($mach.build.os == $mach.os.windows) {
+                if (reserved_device(?src[i], len)) {
+                    out[o] = '_';
+                    o      = o + 1;
+                }
+            }
+            var k: usize = i;
+            for (k < j) {
+                var c: u8 = src[k];
+                # a backslash in a Windows name is not a valid character
+                if (e.h.host_os == H.HOST_WINDOWS && c == '\\') { c = '_'; }
+                $if ($mach.build.os == $mach.os.windows) {
+                    if (c < 0x20 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') { c = '_'; }
+                    if (k >= end)                                                                                     { c = '_'; }
+                }
+                out[o] = c;
+                o      = o + 1;
+                k      = k + 1;
+            }
+        }
+        i = j + 1;
+    }
+    out[o] = 0;
+    if (o == 0) {
+        M.free(out, n + 2 * (n / 2 + 1) + 1);
+        ret nil;
+    }
+    ret out;
+}
+
+fun join(dest: *u8, rel: *u8) *u8 {
+    if (dest == nil || dest[0] == 0) { ret M.dup(rel, M.cstr_len(rel)); }
+    val dl:  usize = M.cstr_len(dest);
+    val rl:  usize = M.cstr_len(rel);
+    val out: *u8   = M.alloc(dl + rl + 2);
+    if (out == nil) { ret nil; }
+    M.copy(out, dest, dl);
+    var o: usize = dl;
+    if (dest[dl - 1] != '/') {
+        out[o] = '/';
+        o      = o + 1;
+    }
+    M.copy(?out[o], rel, rl);
+    out[o + rl] = 0;
+    ret out;
+}
+
+# create every directory leading to path (not path itself)
+fun make_parents(path: *u8) bool {
+    val n: usize = M.cstr_len(path);
+    var i: usize = n;
+    for (i > 0 && path[i - 1] != '/') { i = i - 1; }
+    if (i <= 1) { ret true; }
+    val parent: *u8 = M.dup(path, i - 1);
+    if (parent == nil) { ret false; }
+    val r: err[fs.FsError] = fs.create_dir_all(M.allocator(), parent::str, 0x1ED);
+    M.free(parent, i);
+    if (sel r.err) { ret false; }
+    ret true;
+}
+
+fun path_exists(path: *u8) bool {
+    val m: res[fs.Metadata, io_error.Error] = fs.metadata_link(path::str);
+    if (sel m.err) { ret false; }
+    ret true;
+}
+
+# ---------------------------------------------------------------- keys
+
+fun entry_keys4(st: *State, e: *AR.Entry) E.Code {
+    val ar: *AR.Archive = st.ar;
+    if (ar.password == nil) { ret E.NEED_PASSWORD; }
+    if (e.h.unp_ver < 29)   { ret E.UNSUPPORTED; }
+    var same: bool  = st.key4_valid;
+    var i:    usize = 0;
+    for (same && i < 8) {
+        if (st.key4_salt[i] != e.h.crypt.salt[i]) { same = false; }
+        i = i + 1;
+    }
+    if (!same) {
+        C4.derive(ar.password, ar.pw_len, ?e.h.crypt.salt[0], ?st.keys4);
+        M.copy(?st.key4_salt[0], ?e.h.crypt.salt[0], 8);
+        st.key4_valid = true;
+    }
+    ret E.OK;
+}
+
+fun entry_keys(st: *State, e: *AR.Entry) E.Code {
+    val ar: *AR.Archive = st.ar;
+    if (ar.password == nil)     { ret E.NEED_PASSWORD; }
+    if (e.h.crypt.version != 0) { ret E.UNSUPPORTED; }
+    var same: bool  = st.key_valid && st.key_kdf == e.h.crypt.kdf_count;
+    var i:    usize = 0;
+    for (same && i < 16) {
+        if (st.key_salt[i] != e.h.crypt.salt[i]) { same = false; }
+        i = i + 1;
+    }
+    if (!same) {
+        if (!C.derive(ar.password, ar.pw_len, ?e.h.crypt.salt[0], e.h.crypt.kdf_count, ?st.keys)) { ret E.UNSUPPORTED; }
+        M.copy(?st.key_salt[0], ?e.h.crypt.salt[0], 16);
+        st.key_kdf   = e.h.crypt.kdf_count;
+        st.key_valid = true;
+    }
+    if ((e.h.crypt.flags & H.CRYPT_PSWCHECK) != 0 && C.check_value_intact(?e.h.crypt.check[0])) {
+        if (!C.check_matches(?st.keys, ?e.h.crypt.check[0])) { ret E.BAD_PASSWORD; }
+    }
+    ret E.OK;
+}
+
+# ---------------------------------------------------------------- data
+
+# decode an entry's data into the sink and verify its checksums
+fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
+    val ar: *AR.Archive = st.ar;
+    if (!e.complete) { ret E.MISSING_VOLUME; }
+
+    var p: S.Packed;
+    S.packed_open(?p, ar, e);
+    if (e.h.crypt.present && e.h.crypt.rar4) {
+        val kc: E.Code = entry_keys4(st, e);
+        if (kc != E.OK) { ret kc; }
+        S.packed_encrypt128(?p, ?st.keys4.key[0], ?st.keys4.iv[0]);
+    }
+    or (e.h.crypt.present) {
+        val kc: E.Code = entry_keys(st, e);
+        if (kc != E.OK) { ret kc; }
+        S.packed_encrypt(?p, ?st.keys.key[0], ?e.h.crypt.iv[0]);
+    }
+
+    val known: bool   = (e.h.flags & H.FHFL_UNPUNKNOWN) == 0;
+    var rc:    E.Code = E.OK;
+    if (e.h.method == 0) {
+        var buf:  [65536]u8;
+        var left: u64 = e.h.unp_size;
+        for (!known || left > 0) {
+            var want: usize = 65536;
+            if (known && left < want::u64) { want = left::usize; }
+            val got: usize = S.packed_read(?p, ?buf[0], want);
+            S.sink_write(sink, ?buf[0], got);
+            if (known) { left = left - got::u64; }
+            if (got < want) {
+                if (known) { rc = E.TRUNCATED; }
+                brk;
+            }
+        }
+    }
+    or {
+        if (e.h.rar4) {
+            # RAR 3.x/4.x compression; the 1.5 and 2.x algorithms are not supported
+            if (e.h.unp_ver != 29 && e.h.unp_ver != 36) { ret E.UNSUPPORTED; }
+            if (!(known && e.h.unp_size == 0 && AR.packed_size(ar, e) == 0)) {
+                rc = U4.run(?st.unp4, ?p, sink, e.h.unp_size, known, e.h.solid);
+            }
+        }
+        or (e.h.comp_version != 0 && !e.h.v1_as_v0) { ret E.UNSUPPORTED; }
+        # an empty file has no blocks at all, even in a solid stream
+        or (!(known && e.h.unp_size == 0 && AR.packed_size(ar, e) == 0)) {
+            rc = U.begin(?st.unp, e.h.dict_size, e.h.solid);
+            if (rc == E.OK) { rc = U.run(?st.unp, ?p, sink, e.h.unp_size, known); }
+        }
+    }
+    S.packed_drain(?p);
+    if (rc != E.OK) { ret rc; }
+    if (p.part_bad) { ret E.DATA_CRC; }
+
+    val tweak: bool        = e.h.crypt.present && !e.h.crypt.rar4 && (e.h.crypt.flags & H.CRYPT_HASHMAC) != 0;
+    val last:  *AR.Segment = AR.segment(ar, e.seg_last);
+    if (last.has_crc) {
+        var crc: u32 = S.sink_crc(sink);
+        if (tweak) { crc = C.tweak_crc(?st.keys, crc); }
+        if (crc != last.crc) {
+            # RAR 4 has no password check: a wrong password fails here
+            if (e.h.crypt.present && e.h.crypt.rar4) { ret E.BAD_PASSWORD; }
+            ret E.DATA_CRC;
+        }
+    }
+    if (last.has_blake2) {
+        var d: [32]u8;
+        S.sink_blake2(sink, ?d[0]);
+        if (tweak) {
+            var t: [32]u8;
+            C.tweak_digest(?st.keys, ?d[0], ?t[0]);
+            M.copy(?d[0], ?t[0], 32);
+        }
+        var i: usize = 0;
+        for (i < 32) {
+            if (d[i] != last.blake2[i]) { ret E.DATA_CRC; }
+            i = i + 1;
+        }
+    }
+    ret E.OK;
+}
+
+# ---------------------------------------------------------------- output
+
+fun report(st: *State, verb: str, e: *AR.Entry, rc: E.Code) {
+    if (rc == E.OK) {
+        st.done = st.done + 1;
+        if (!st.opt.quiet && st.opt.mode != MODE_PRINT) { print.printf("{:<11} {}  OK\n", verb, e.name::str); }
+        ret;
+    }
+    st.errors = st.errors + 1;
+    print.eprintf("{:<11} {}  FAILED: {}\n", verb, e.name::str, E.message(rc));
+}
+
+fun apply_metadata(e: *AR.Entry, path: *u8) {
+    if (e.h.host_os == H.HOST_UNIX) {
+        # permission bits, without set-id bits from an untrusted archive
+        P.set_mode(path, (e.h.attr & 0x3FF)::i32);
+    }
+    if (e.h.mtime.present) {
+        var at: H.Time = e.h.mtime;
+        if (e.h.atime.present) { at = e.h.atime; }
+        P.set_times(path, at.sec, at.nsec, e.h.mtime.sec, e.h.mtime.nsec);
+    }
+    # attributes last: a read-only file cannot get its times set after
+    if (e.h.host_os == H.HOST_WINDOWS) { P.set_attributes(path, e.h.attr::u32); }
+}
+
+fun write_file(st: *State, e: *AR.Entry, path: *u8) E.Code {
+    if (!make_parents(path)) { ret E.CREATE; }
+    if (path_exists(path)) {
+        if (st.opt.overwrite != OVERWRITE_ALL) { ret E.OK; }
+        fs.remove_file(path::str);
+    }
+    val fr: res[fs.File, io_error.Error] = fs.create(path::str, 0x1A4);
+    if (sel fr.err) { ret E.CREATE; }
+    var f:    fs.File = fr.ok;
+    var sink: S.Sink;
+    S.sink_init(?sink, S.SINK_FD, f.handle.value, e.h.has_blake2);
+    val rc: E.Code = unpack_entry(st, e, ?sink);
+    fs.close(?f);
+    if (rc == E.OK && sink.failed) {
+        fs.remove_file(path::str);
+        ret E.WRITE;
+    }
+    if (rc != E.OK) {
+        fs.remove_file(path::str);
+        ret rc;
+    }
+    apply_metadata(e, path);
+    ret E.OK;
+}
+
+# copy an already extracted file, for file references and failed hard links
+fun copy_file(from: *u8, to: *u8) E.Code {
+    val sr: res[fs.File, io_error.Error] = fs.open(from::str);
+    if (sel sr.err) { ret E.OPEN; }
+    var src: fs.File                      = sr.ok;
+    val dr:  res[fs.File, io_error.Error] = fs.create(to::str, 0x1A4);
+    if (sel dr.err) {
+        fs.close(?src);
+        ret E.CREATE;
+    }
+    var dst: fs.File = dr.ok;
+    var buf: [65536]u8;
+    var rc:  E.Code  = E.OK;
+    for {
+        val r: res[usize, io_error.Error] = fs.read(src, ?buf[0], 65536);
+        if (sel r.err) {
+            rc = E.READ;
+            brk;
+        }
+        if (r.ok == 0) { brk; }
+        var off: usize = 0;
+        for (off < r.ok) {
+            val w: res[usize, io_error.Error] = fs.write(dst, ?buf[off], r.ok - off);
+            if (sel w.err) {
+                rc = E.WRITE;
+                brk;
+            }
+            off = off + w.ok;
+        }
+        if (rc != E.OK) { brk; }
+    }
+    fs.close(?src);
+    fs.close(?dst);
+    ret rc;
+}
+
+# a RAR 4 link target that is compressed or encrypted: unpack it
+fun load_link(st: *State, e: *AR.Entry) E.Code {
+    var buf:  [4096]u8;
+    var sink: S.Sink;
+    S.sink_memory(?sink, ?buf[0], 4095);
+    val rc: E.Code = unpack_entry(st, e, ?sink);
+    if (rc != E.OK)  { ret rc; }
+    if (sink.failed) { ret E.UNSUPPORTED; }
+    e.link = M.dup(?buf[0], sink.written::usize);
+    ret E.OK;
+}
+
+fun extract_link(st: *State, e: *AR.Entry, i: usize, path: *u8) E.Code {
+    val t: u64 = e.h.redir_type;
+    if (e.link == nil && e.h.rar4) {
+        val lc: E.Code = load_link(st, e);
+        if (lc != E.OK) { ret lc; }
+    }
+    if (e.link == nil)       { ret E.BAD_HEADER; }
+    if (!make_parents(path)) { ret E.CREATE; }
+    if (path_exists(path)) {
+        if (st.opt.overwrite != OVERWRITE_ALL) { ret E.OK; }
+    }
+
+    if (t == H.REDIR_UNIX_SYMLINK || t == H.REDIR_WIN_SYMLINK || t == H.REDIR_JUNCTION) {
+        var d: Deferred;
+        d.path   = path;
+        d.target = e.link;
+        d.entry  = i;
+        V.push[Deferred](?st.links, d);
+        ret E.OK;
+    }
+
+    # hard links and file references name another archived file, which must
+    # be inside the destination like any other name
+    var ref: AR.Entry = @e;
+    ref.name = e.link;
+    val rel: *u8 = safe_name(?ref, false);
+    if (rel == nil) { ret E.UNSAFE_PATH; }
+    val target: *u8 = join(st.opt.dest, rel);
+    if (target == nil)                                           { ret E.NO_MEMORY; }
+    if (path_exists(path))                                       { fs.remove_file(path::str); }
+    if (t == H.REDIR_HARDLINK && P.hard_link(target, path) == 0) { ret E.OK; }
+    if (t == H.REDIR_HARDLINK || t == H.REDIR_FILECOPY) {
+        val rc: E.Code = copy_file(target, path);
+        if (rc == E.OK) { apply_metadata(e, path); }
+        ret rc;
+    }
+    ret E.UNSUPPORTED;
+}
+
+fun finish_links(st: *State) {
+    var i: usize = 0;
+    for (i < st.links.len) {
+        val d: *Deferred = ?st.links.data[i];
+        val e: *AR.Entry = AR.entry(st.ar, d.entry);
+        if (path_exists(d.path)) { fs.remove_file(d.path::str); }
+        val r:  err[io_error.Error] = fs.symlink(d.target::str, d.path::str);
+        var rc: E.Code              = E.OK;
+        if (sel r.err) { rc = E.CREATE; }
+        or {
+            if (e.h.mtime.present) {
+                P.set_times(d.path, e.h.mtime.sec, e.h.mtime.nsec, e.h.mtime.sec, e.h.mtime.nsec);
+            }
+        }
+        report(st, "Extracting", e, rc);
+        i = i + 1;
+    }
+    # directory times last, after their contents stopped changing them
+    i = st.dirs.len;
+    for (i > 0) {
+        i = i - 1;
+        val d: *Deferred = ?st.dirs.data[i];
+        apply_metadata(AR.entry(st.ar, d.entry), d.path);
+    }
+}
+
+# ---------------------------------------------------------------- driver
+
+# does any later entry continue this one's solid stream
+fun solid_successor(ar: *AR.Archive, i: usize) bool {
+    var k: usize = i + 1;
+    for (k < ar.entries.len) {
+        val e: *AR.Entry = AR.entry(ar, k);
+        if (!e.service && e.h.method != 0) { ret e.h.solid; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun process(st: *State, i: usize) {
+    val ar: *AR.Archive = st.ar;
+    val e:  *AR.Entry   = AR.entry(ar, i);
+    if (e.service) { ret; }
+    # older file versions are extracted only on request, as "name;N"
+    val want: bool = selected(st, e) && (st.opt.versions || e.h.file_version == 0);
+    val mode: u8   = st.opt.mode;
+
+    if (!want) {
+        # keep a solid stream intact by decoding what a later file needs
+        if (e.h.method != 0 && !AR.is_dir(e) && e.h.redir_type == H.REDIR_NONE && solid_successor(ar, i)) {
+            var sink: S.Sink;
+            S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
+            unpack_entry(st, e, ?sink);
+        }
+        ret;
+    }
+
+    if (mode == MODE_TEST || mode == MODE_PRINT) {
+        if (AR.is_dir(e)) { ret; }
+        # RAR 5 links carry no data; RAR 4 links store the target as data
+        if (e.h.redir_type != H.REDIR_NONE && !e.h.rar4) {
+            if (mode == MODE_TEST) { report(st, "Testing", e, E.OK); }
+            ret;
+        }
+        var sink: S.Sink;
+        if (mode == MODE_PRINT) {
+            S.sink_init(?sink, S.SINK_FD, 1, e.h.has_blake2);
+        }
+        or {
+            S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
+        }
+        val rc: E.Code = unpack_entry(st, e, ?sink);
+        if (mode == MODE_TEST) { report(st, "Testing", e, rc); }
+        or                     { report(st, "Printing", e, rc); }
+        ret;
+    }
+
+    if (mode == MODE_FLAT && AR.is_dir(e)) { ret; }
+    val rel: *u8 = safe_name(e, mode == MODE_FLAT);
+    if (rel == nil) {
+        report(st, "Extracting", e, E.UNSAFE_PATH);
+        if (e.h.method != 0 && solid_successor(ar, i)) {
+            var sink: S.Sink;
+            S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
+            unpack_entry(st, e, ?sink);
+        }
+        ret;
+    }
+    val path: *u8 = join(st.opt.dest, rel);
+    if (path == nil) {
+        report(st, "Extracting", e, E.NO_MEMORY);
+        ret;
+    }
+
+    if (AR.is_dir(e)) {
+        val r:  err[fs.FsError] = fs.create_dir_all(M.allocator(), path::str, 0x1ED);
+        var rc: E.Code          = E.OK;
+        if (sel r.err) { rc = E.CREATE; }
+        or {
+            var d: Deferred;
+            d.path   = path;
+            d.target = nil;
+            d.entry  = i;
+            V.push[Deferred](?st.dirs, d);
+        }
+        report(st, "Creating", e, rc);
+        ret;
+    }
+    if (e.h.redir_type != H.REDIR_NONE) {
+        val rc: E.Code = extract_link(st, e, i, path);
+        if (rc != E.OK || (e.h.redir_type != H.REDIR_UNIX_SYMLINK && e.h.redir_type != H.REDIR_WIN_SYMLINK &&
+            e.h.redir_type != H.REDIR_JUNCTION)) {
+            report(st, "Extracting", e, rc);
+        }
+        ret;
+    }
+    report(st, "Extracting", e, write_file(st, e, path));
+}
+
+# unpack a compressed archive comment (RAR 4 CMT blocks) into ar.comment
+pub fun load_comment(ar: *AR.Archive) {
+    if (ar.comment != nil) { ret; }
+    var i: usize = 0;
+    for (i < ar.entries.len) {
+        val e: *AR.Entry = AR.entry(ar, i);
+        if (e.service && M.cstr_eq(e.name, "CMT"::*u8) && e.h.unp_size > 0 && e.h.unp_size < 0x40000 &&
+            !e.h.crypt.present) {
+            var opt: Options;
+            opt.mode      = MODE_TEST;
+            opt.dest      = nil;
+            opt.overwrite = OVERWRITE_SKIP;
+            opt.names     = nil;
+            opt.nnames    = 0;
+            opt.quiet     = true;
+            opt.versions  = false;
+            var st: State;
+            st.ar  = ar;
+            st.opt = ?opt;
+            U.init(?st.unp);
+            U4.init(?st.unp4);
+            st.key_valid  = false;
+            st.key4_valid = false;
+            val n:   usize = e.h.unp_size::usize;
+            val buf: *u8   = M.alloc(n + 1);
+            if (buf == nil) { ret; }
+            var sink: S.Sink;
+            S.sink_memory(?sink, buf, n);
+            # comments never continue a solid stream
+            val solid: bool = e.h.solid;
+            e.h.solid = false;
+            val rc: E.Code = unpack_entry(?st, e, ?sink);
+            e.h.solid = solid;
+            U.dnit(?st.unp);
+            U4.dnit(?st.unp4);
+            if (rc == E.OK && !sink.failed) {
+                ar.comment     = buf;
+                ar.comment_len = sink.written::usize;
+            }
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+pub fun run(ar: *AR.Archive, opt: *Options) i64 {
+    var st: State;
+    st.ar  = ar;
+    st.opt = opt;
+    U.init(?st.unp);
+    U4.init(?st.unp4);
+    st.key_valid  = false;
+    st.key4_valid = false;
+    st.links      = V.init[Deferred](M.allocator());
+    st.dirs       = V.init[Deferred](M.allocator());
+    st.errors     = 0;
+    st.done       = 0;
+
+    if (opt.dest != nil && opt.dest[0] != 0 && (opt.mode == MODE_EXTRACT || opt.mode == MODE_FLAT)) {
+        fs.create_dir_all(M.allocator(), opt.dest::str, 0x1ED);
+    }
+
+    var i: usize = 0;
+    for (i < ar.entries.len) {
+        process(?st, i);
+        i = i + 1;
+    }
+    finish_links(?st);
+    U.dnit(?st.unp);
+    U4.dnit(?st.unp4);
+
+    if (ar.bad_headers > 0) {
+        print.eprintf("ramjet: {} damaged header(s)\n", ar.bad_headers);
+        st.errors = st.errors + 1;
+    }
+    if (ar.truncated) {
+        print.eprintln("ramjet: archive is truncated");
+        st.errors = st.errors + 1;
+    }
+    if (ar.missing_volume) {
+        print.eprintln("ramjet: a following volume is missing");
+        st.errors = st.errors + 1;
+    }
+    if (st.errors > 0) {
+        print.eprintf("ramjet: {} error(s)\n", st.errors);
+        ret 1;
+    }
+    if (!opt.quiet && opt.mode != MODE_PRINT) { print.println("All OK"); }
+    ret 0;
+}
+
+test extract__matches {
+    if (!matches("*.txt"::*u8, "a.txt"::*u8))   { ret 1; }
+    if (matches("*.txt"::*u8, "a.bin"::*u8))    { ret 2; }
+    if (!matches("dir"::*u8, "dir/sub/x"::*u8)) { ret 3; }
+    if (!matches("d?r/*"::*u8, "dir/x"::*u8))   { ret 4; }
+    if (matches("dir"::*u8, "directory"::*u8))  { ret 5; }
+    ret 0;
+}
