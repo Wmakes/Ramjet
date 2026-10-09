@@ -6,6 +6,11 @@ also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
 ## Unreleased
 
+- Checksums (CRC32, BLAKE2sp) and file writes run on a second thread for
+  files of 1 MB and more, overlapping with decompression.
+- BLAKE2s compression is unrolled: archives with BLAKE2 checksums test
+  about 1.4x faster.
+
 - Fix: RAR 3.x and 4.x archives with passwords of 29 or more characters
   did not decrypt. RAR hashes the password with a SHA-1 quirk that
   overwrites the password buffer once it passes 64 bytes; checked against

@@ -18,10 +18,12 @@ use std.types.string.str;
 
 use AR: ramjet.archive;
 use ramjet.crypto.aes;
-use b2: ramjet.crypto.blake2;
-use E:  ramjet.errors;
-use M:  ramjet.mem;
-use OC: ramjet.rar4.crypt_old;
+use b2:  ramjet.crypto.blake2;
+use E:   ramjet.errors;
+use M:   ramjet.mem;
+use OC:  ramjet.rar4.crypt_old;
+use sem: std.sync.semaphore;
+use std.sync.thread;
 
 pub rec Packed {
     ar:       *AR.Archive;
@@ -182,6 +184,12 @@ pub rec Sink {
     prog_shown: bool;
     prog_verb:  str;
     prog_name:  *u8;
+
+    # data goes through the worker thread in chunks (see sink_pipeline);
+    # cur is the chunk being filled, or -1
+    piped:   bool;
+    cur:     i64;
+    cur_len: usize;
 }
 
 pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
@@ -196,6 +204,9 @@ pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
     s.mem_cap    = 0;
     s.prog_on    = false;
     s.prog_shown = false;
+    s.piped      = false;
+    s.cur        = -1;
+    s.cur_len    = 0;
 }
 
 # show "<verb> <name>  NN%" on stdout as data arrives, for files of `total`
@@ -227,20 +238,10 @@ pub fun sink_memory(s: *Sink, buf: *u8, cap: usize) {
     s.mem_cap = cap;
 }
 
-pub fun sink_write(s: *Sink, p: *u8, n: usize) {
-    if (n == 0) { ret; }
+# hash and store n bytes; runs on the worker thread for piped sinks
+fun consume(s: *Sink, p: *u8, n: usize) {
     s.crc = crc32.update(s.crc, p, n);
     if (s.use_blake2) { b2.sp_update(?s.blake2, p, n); }
-    if (s.mode == SINK_MEMORY) {
-        if (s.written + n::u64 > s.mem_cap::u64) {
-            s.failed = true;
-        }
-        or {
-            M.copy(?s.mem[s.written::usize], p, n);
-        }
-    }
-    s.written = s.written + n::u64;
-    if (s.prog_on && s.written >= s.prog_next) { progress(s); }
     if (s.mode == SINK_FD && !s.failed) {
         var off: usize = 0;
         for (off < n) {
@@ -252,6 +253,149 @@ pub fun sink_write(s: *Sink, p: *u8, n: usize) {
             off = off + w::usize;
         }
     }
+}
+
+pub fun sink_write(s: *Sink, p: *u8, n: usize) {
+    if (n == 0) { ret; }
+    if (s.mode == SINK_MEMORY) {
+        s.crc = crc32.update(s.crc, p, n);
+        if (s.written + n::u64 > s.mem_cap::u64) {
+            s.failed = true;
+        }
+        or {
+            M.copy(?s.mem[s.written::usize], p, n);
+        }
+    }
+    or (s.piped) {
+        # copy into chunks; the worker hashes and writes them in order
+        var off: usize = 0;
+        for (off < n) {
+            if (s.cur < 0) {
+                sem.wait(?pipe.empty);
+                s.cur     = pipe.head::i64;
+                s.cur_len = 0;
+                pipe.head = (pipe.head + 1) % CHUNKS;
+            }
+            var take: usize = CHUNK - s.cur_len;
+            if (take > n - off) { take = n - off; }
+            M.copy(?pipe.chunks[s.cur::usize].data[s.cur_len], ?p[off], take);
+            s.cur_len = s.cur_len + take;
+            off       = off + take;
+            if (s.cur_len == CHUNK) { submit(s); }
+        }
+    }
+    or {
+        consume(s, p, n);
+    }
+    s.written = s.written + n::u64;
+    if (s.prog_on && s.written >= s.prog_next) { progress(s); }
+}
+
+# ---------------------------------------------------------------- worker
+
+# checksums and file writes run on a second thread for large outputs, so
+# they overlap with decompression. the decoder fills 1 MB chunks from a ring
+# of four; the worker takes them in order.
+val CHUNKS: usize = 4;
+val CHUNK:  usize = 0x100000;
+
+rec Chunk {
+    data: *u8;
+    len:  usize;
+    sink: *Sink;
+    stop: bool;
+}
+
+rec Pipe {
+    tried:  bool;
+    ok:     bool;
+    chunks: [4]Chunk;
+    full:   sem.Semaphore;
+    empty:  sem.Semaphore;
+    head:   usize;
+    tail:   usize;
+    worker: thread.Thread;
+}
+
+var pipe: Pipe;
+
+fun worker(arg: *u8) {
+    for {
+        sem.wait(?pipe.full);
+        val c: *Chunk = ?pipe.chunks[pipe.tail];
+        if (c.stop) { ret; }
+        consume(c.sink, c.data, c.len);
+        pipe.tail = (pipe.tail + 1) % CHUNKS;
+        sem.release(?pipe.empty);
+    }
+}
+
+fun pipe_start() bool {
+    if (pipe.tried) { ret pipe.ok; }
+    pipe.tried = true;
+    pipe.ok    = false;
+    var i: usize = 0;
+    for (i < CHUNKS) {
+        pipe.chunks[i].data = M.alloc(CHUNK);
+        if (pipe.chunks[i].data == nil) { ret false; }
+        pipe.chunks[i].stop = false;
+        i                   = i + 1;
+    }
+    sem.init(?pipe.full, 0, CHUNKS::i64);
+    sem.init(?pipe.empty, CHUNKS::i64, CHUNKS::i64);
+    pipe.head = 0;
+    pipe.tail = 0;
+    val r: thread.Operation = thread.spawn_with(worker, nil, ?pipe.worker);
+    if (sel r.err) { ret false; }
+    pipe.ok = true;
+    ret true;
+}
+
+fun submit(s: *Sink) {
+    val c: *Chunk = ?pipe.chunks[s.cur::usize];
+    c.len  = s.cur_len;
+    c.sink = s;
+    c.stop = false;
+    s.cur  = -1;
+    sem.release(?pipe.full);
+}
+
+# hand this sink's data to the worker thread when it is large enough to be
+# worth it; falls back to doing everything inline
+pub fun sink_pipeline(s: *Sink, expected: u64) {
+    if (s.mode == SINK_MEMORY || expected < CHUNK::u64) { ret; }
+    if (!pipe_start())                                  { ret; }
+    s.piped = true;
+}
+
+# wait until the worker has hashed and written everything; required before
+# the sink's checksums, failure flag or the output file are looked at
+pub fun sink_finish(s: *Sink) {
+    if (!s.piped)   { ret; }
+    if (s.cur >= 0) { submit(s); }
+    # every chunk back on the empty side means the worker is idle
+    var i: usize = 0;
+    for (i < CHUNKS) {
+        sem.wait(?pipe.empty);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < CHUNKS) {
+        sem.release(?pipe.empty);
+        i = i + 1;
+    }
+    s.piped = false;
+}
+
+# stop the worker thread, if one was started
+pub fun shutdown() {
+    if (!pipe.ok) { ret; }
+    sem.wait(?pipe.empty);
+    pipe.chunks[pipe.head].stop = true;
+    sem.release(?pipe.full);
+    thread.join(?pipe.worker);
+    pipe.ok    = false;
+    pipe.tried = false;
 }
 
 pub fun sink_crc(s: *Sink) u32 {

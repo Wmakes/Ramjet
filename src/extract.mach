@@ -389,6 +389,7 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
 
     var p: S.Packed;
     S.packed_open(?p, ar, e);
+    S.sink_pipeline(sink, e.h.unp_size);
     if (e.h.crypt.present && e.h.crypt.rar4 && old_cipher(e) != 0) {
         if (ar.password == nil) { ret E.NEED_PASSWORD; }
         S.packed_encrypt_old(?p, old_cipher(e), ar.password, ar.pw_len);
@@ -439,6 +440,8 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
         }
     }
     S.packed_drain(?p);
+    # the worker thread must be done before anything about the output is read
+    S.sink_finish(sink);
     if (rc != E.OK) { ret rc; }
     if (p.part_bad) { ret E.DATA_CRC; }
 
@@ -978,6 +981,7 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
         i = i + 1;
     }
     finish_links(?st);
+    S.shutdown();
     U.dnit(?st.unp);
     U4.dnit(?st.unp4);
     U15.dnit(?st.unp15);
