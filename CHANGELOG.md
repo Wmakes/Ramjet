@@ -4,7 +4,7 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
-## 0.3.1 — 2026-10-10
+## 0.3.1 — 2026-10-09
 
 Speed.
 
