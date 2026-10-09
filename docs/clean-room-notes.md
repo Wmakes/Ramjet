@@ -117,3 +117,23 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
   produces version 0 data.
 - **Windows-only metadata** (NTFS ACL and stream service headers): parsed
   and skipped.
+
+## Audit (2026-10-09, before the first public release)
+
+A token comparison checked all 29 source files against every
+reference file that was read (libarchive's RAR readers and PPMd code, the
+XADMaster files), looking for shared runs of 10 or more code tokens and 7 or
+more comment words:
+
+- comments: no shared phrases
+- code: only short idioms (bit rotation, a vint loop test) and algorithm
+  formulas: SHA-1's standard message schedule (FIPS 180-4), PPMd var.H
+  model updates (public-domain algorithm; Ramjet keeps some of its variable
+  names, such as `ns1` and `u2b`)
+- constant tables that the formats fix: the RAR 2.0 cipher's substitution
+  table and PPMd's escape table
+
+The repository distributes only Ramjet's own sources, scripts and
+documentation; no RAR binaries, RAR documentation or sample archives made by
+RAR are committed. Ramjet's binaries include mach-std (MIT); see
+`THIRD_PARTY_NOTICES.txt`.

@@ -155,7 +155,7 @@ When adding a new feature, prefer:
 
 Ramjet is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
 
-See [`LICENSE`](LICENSE) for the complete license text.
+See [`LICENSE`](LICENSE) for the complete license text. Binaries include the Mach standard library (MIT); see [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt).
 
 This license applies to the original Ramjet source code.
 
