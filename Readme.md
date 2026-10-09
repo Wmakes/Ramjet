@@ -115,6 +115,17 @@ tests/compare_list.py [bin] [dir]    compare `ramjet lt` with `rar lt` (dir: tes
 tests/fuzz.py 1000                   corrupted archives must never crash ramjet
 ```
 
+## Releases
+
+The version lives in `mach.toml` (`ramjet --version` reads it at build time) and follows semantic versioning. A release is:
+
+1. bump `version` in `mach.toml` and add a section to [`CHANGELOG.md`](CHANGELOG.md)
+2. commit, then tag it: `git tag -a vX.Y.Z -m "Ramjet X.Y.Z"`
+3. `git push origin main vX.Y.Z`
+4. build `mach build . -t <target> -p release` for each target and attach the binaries to a GitHub release for the tag
+
+Another Mach project can depend on a release with `ref = "tag/vX.Y.Z"`.
+
 ## Contributing
 
 Contributions are welcome.
