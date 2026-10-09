@@ -62,6 +62,20 @@ pub fun zero_bytes(p: *u8, n: usize) {
     if (n > 0) { memory.raw_zero(p::ptr, n); }
 }
 
+# copy an LZ match of len bytes from src to dst = src + dist, 8 bytes at a
+# time; needs dist >= 8 and may write up to 7 bytes past dst + len (callers
+# keep that slack free). reads never pass bytes this copy has not written.
+#[inline]
+pub fun lz_copy8(dst: *u8, src: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) {
+        val d: *u64 = (?dst[i])::*u64;
+        val s: *u64 = (?src[i])::*u64;
+        @d = @s;
+        i  = i + 8;
+    }
+}
+
 # copy n bytes between non-overlapping ranges
 pub fun copy(dst: *u8, src: *u8, n: usize) {
     if (n > 0) { memory.raw_copy(dst::ptr, src::ptr, n); }

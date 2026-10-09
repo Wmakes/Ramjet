@@ -111,6 +111,7 @@ pub fun build(h: *Huff, lengths: *u8, n: usize) bool {
 # decode the code at the top of `bits` (16 bits, left aligned)
 # ---
 # ret: symbol | (code length << 16); symbol INVALID when nothing matches
+#[inline]
 pub fun lookup(h: *Huff, bits: u32) u32 {
     val q:  usize = (bits >> (16 - QUICK_BITS))::usize;
     val ql: u8    = h.quick_len[q];

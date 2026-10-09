@@ -4,6 +4,15 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## Unreleased
+
+Speed.
+
+- RAR 2.9-4.x LZ decoding is about 2.3x faster: a 64 KB scratch buffer for
+  rare filter code sat in the stack frame of the per-symbol function.
+- PPMd decoding is about 1.4x faster (inlined model access, direct loads).
+- RAR 5 and RAR 4 matches are copied 8 bytes at a time.
+
 ## 0.3.0 — 2026-10-09
 
 Older archives.

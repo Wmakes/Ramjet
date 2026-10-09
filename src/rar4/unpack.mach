@@ -105,6 +105,9 @@ pub rec Unpacker {
     filters:   *Filter;
     nfilters:  usize;
     vm:        *u8;
+    # filter code being read; kept here so the per-symbol functions that
+    # might read one do not carry a 64 KB stack frame
+    code: *u8;
 
     bi:     BI.BitIn;
     ended:  bool;
@@ -116,6 +119,7 @@ pub fun init(u: *Unpacker) {
     u.progs   = nil;
     u.filters = nil;
     u.vm      = nil;
+    u.code    = nil;
     u.bi.buf  = nil;
     PM.construct(?u.model);
     u.ppm_ready = false;
@@ -152,6 +156,8 @@ pub fun dnit(u: *Unpacker) {
     if (u.progs != nil)   { M.free(u.progs::*u8, MAX_PROGRAMS * $size_of(Program)); }
     if (u.filters != nil) { M.free(u.filters::*u8, MAX_FILTERS * $size_of(Filter)); }
     if (u.vm != nil)      { M.free(u.vm, VM_MEMORY + 8); }
+    if (u.code != nil)    { M.free(u.code, 0x10000); }
+    u.code = nil;
     PM.free(?u.model);
     BI.dnit(?u.bi);
     u.window  = nil;
@@ -162,6 +168,7 @@ pub fun dnit(u: *Unpacker) {
 
 # ---------------------------------------------------------------- tables
 
+#[inline]
 fun decode(u: *Unpacker, h: *HF.Huff) u32 {
     val r: u32 = HF.lookup(h, BI.peek16(?u.bi));
     BI.skip(?u.bi, r >> 16);
@@ -286,18 +293,20 @@ fun read_tables(u: *Unpacker) bool {
 
 # ---------------------------------------------------------------- output
 
+#[inline]
 fun put(u: *Unpacker, b: u8) {
     u.window[(u.pos & (WINDOW - 1))::usize] = b;
     u.pos                                   = u.pos + 1;
 }
 
+#[inline]
 fun copy_match(u: *Unpacker, len: u64, dist: u64) {
     val mask: u64 = WINDOW - 1;
     val w:    *u8 = u.window;
     val d:    u64 = u.pos & mask;
     val sidx: u64 = (u.pos - dist) & mask;
-    if (dist >= len && dist <= u.pos && d + len <= WINDOW && sidx + len <= WINDOW) {
-        M.copy(?w[d::usize], ?w[sidx::usize], len::usize);
+    if (dist >= 8 && dist <= u.pos && d + len + 8 <= WINDOW && sidx + len + 8 <= WINDOW) {
+        M.lz_copy8(?w[d::usize], ?w[sidx::usize], len::usize);
         u.pos = u.pos + len;
         ret;
     }
@@ -478,20 +487,26 @@ fun parse_filter(u: *Unpacker, code: *u8, len: usize, flags: u8) E.Code {
     ret E.OK;
 }
 
+fun filter_buffer(u: *Unpacker) bool {
+    if (u.code == nil) { u.code = M.alloc(0x10000); }
+    ret u.code != nil;
+}
+
 # the filter code bytes: a flags byte whose low 3 bits give the length
 # (7: one more byte + 7, 8: two more bytes), then the bytes
 fun read_filter_lz(u: *Unpacker) E.Code {
     val flags: u8    = BI.bits(?u.bi, 8)::u8;
     var len:   usize = (flags & 7)::usize + 1;
-    if (len == 7) { len = BI.bits(?u.bi, 8)::usize + 7; }
-    or (len == 8) { len = BI.bits(?u.bi, 16)::usize; }
-    var code: [65536]u8;
+    if (len == 7)          { len = BI.bits(?u.bi, 8)::usize + 7; }
+    or (len == 8)          { len = BI.bits(?u.bi, 16)::usize; }
+    if (!filter_buffer(u)) { ret E.NO_MEMORY; }
+    val code: *u8   = u.code;
     var i:    usize = 0;
     for (i < len) {
         code[i] = BI.bits(?u.bi, 8)::u8;
         i       = i + 1;
     }
-    ret parse_filter(u, ?code[0], len, flags);
+    ret parse_filter(u, code, len, flags);
 }
 
 fun ppm_byte(u: *Unpacker, ok: *bool) u8 {
@@ -512,14 +527,15 @@ fun read_filter_ppm(u: *Unpacker) E.Code {
         len = ppm_byte(u, ?ok)::usize << 8;
         len = len | ppm_byte(u, ?ok)::usize;
     }
-    var code: [65536]u8;
+    if (!filter_buffer(u)) { ret E.NO_MEMORY; }
+    val code: *u8   = u.code;
     var i:    usize = 0;
     for (i < len) {
         code[i] = ppm_byte(u, ?ok);
         i       = i + 1;
     }
     if (!ok) { ret E.BAD_DATA; }
-    ret parse_filter(u, ?code[0], len, flags);
+    ret parse_filter(u, code, len, flags);
 }
 
 # ---- the standard filters, each over vm[0..len) with registers r0..r6

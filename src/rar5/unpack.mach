@@ -182,6 +182,7 @@ pub fun begin(u: *Unpacker, dict: u64, solid: bool) E.Code {
 
 # the next 32 bits of the block at the read position, MSB first; the block
 # buffer carries 8 zero bytes past its end so this never reads outside it
+#[inline]
 fun peek32(u: *Unpacker) u32 {
     val byte: usize = (u.bitpos >> 3)::usize;
     val p:    *u8   = ?u.blk[byte];
@@ -189,14 +190,17 @@ fun peek32(u: *Unpacker) u32 {
     ret ((v << (u.bitpos & 7)) >> 8)::u32;
 }
 
+#[inline]
 fun peek16(u: *Unpacker) u32 {
     ret peek32(u) >> 16;
 }
 
+#[inline]
 fun skip_bits(u: *Unpacker, n: u32) {
     u.bitpos = u.bitpos + n::u64;
 }
 
+#[inline]
 fun get_bits(u: *Unpacker, n: u32) u32 {
     if (n == 0) { ret 0; }
     val v: u32 = peek32(u) >> (32 - n);
@@ -215,6 +219,7 @@ fun build(h: *HF.Huff, lengths: *u8, n: usize) bool {
 }
 
 # decode one symbol; returns 0xFFFF for a code that matches nothing
+#[inline]
 fun decode(u: *Unpacker, h: *HF.Huff) u32 {
     val r: u32 = HF.lookup(h, peek16(u));
     skip_bits(u, r >> 16);
@@ -347,18 +352,20 @@ fun read_block(u: *Unpacker, p: *S.Packed) E.Code {
 
 # ---------------------------------------------------------------- output
 
+#[inline]
 fun put(u: *Unpacker, b: u8) {
     u.window[(u.pos & u.wmask)::usize] = b;
     u.pos                              = u.pos + 1;
 }
 
+#[inline]
 fun copy_match(u: *Unpacker, len: u64, dist: u64) {
     var src:  u64 = u.pos - dist;
     val d:    u64 = u.pos & u.wmask;
     val sidx: u64 = src & u.wmask;
-    # the common case: neither range wraps and they do not overlap
-    if (dist >= len && dist <= u.pos && d + len <= u.wsize && sidx + len <= u.wsize) {
-        M.copy(?u.window[d::usize], ?u.window[sidx::usize], len::usize);
+    # the common case: no wrap, 8 bytes or more apart, slack after the end
+    if (dist >= 8 && dist <= u.pos && d + len + 8 <= u.wsize && sidx + len + 8 <= u.wsize) {
+        M.lz_copy8(?u.window[d::usize], ?u.window[sidx::usize], len::usize);
         u.pos = u.pos + len;
         ret;
     }
