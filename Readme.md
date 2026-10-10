@@ -1,4 +1,4 @@
-# Ramjet
+# Ramjet [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)[![Release](https://img.shields.io/github/v/release/Wmakes/Ramjet?include_prereleases)](https://github.com/Wmakes/Ramjet/releases)[![Built with Mach](https://img.shields.io/badge/built%20with-Mach-orange)](https://machlang.org/)[![Platforms](https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-lightgrey)](#status)
 
 **Ramjet** is a fast, independent RAR-compatible archiver written entirely in [Mach](https://machlang.org/). Like its namesake engine, it compresses with nothing but speed.
 
