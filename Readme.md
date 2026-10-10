@@ -39,6 +39,7 @@ Ramjet is an independent implementation.
 ## Status
 
 Ramjet is being built reader first; the writer comes after the reader is complete.
+The aarch64 and macOS targets (darwin-x86_64 ,darwin-aarch64, linux-arm64) are built but not tested.
 
 Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what RAR 2.x through 7.x create):
 
