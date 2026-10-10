@@ -29,7 +29,7 @@ def w(name, data):
 
 w("empty.txt", b"")
 w("hello.txt", b"Hello, Ramjet!\n")
-words = b"ramjet compresses with nothing but speed and a clean room ".split()
+words = b"ramjet is amazing".split()
 w("text.txt", b" ".join(rng.choice(words) for _ in range(40000)) + b"\n")
 w("zeros.bin", bytes(256 * 1024))
 w("random.bin", rng.randbytes(64 * 1024))

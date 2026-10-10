@@ -30,7 +30,7 @@ use TT: ramjet.tty;
 val VERSION: str = $project.version;
 
 fun usage() {
-    print.println("Ramjet - a clean-room RAR reader");
+    print.println("Ramjet - a RAR reader");
     print.println("");
     print.println("usage: ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]");
     print.println("");

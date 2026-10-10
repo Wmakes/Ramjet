@@ -57,7 +57,7 @@ val FP_E8:    u64 = 0x35AD576887;
 val FP_E8E9:  u64 = 0x393CD7E57E;
 val FP_RGB:   u64 = 0x951C2C5DC8;
 val FP_AUDIO: u64 = 0xD8BC85E701;
-# found by running the filter_itanium sample; see docs/clean-room-notes.md
+# found by running the filter_itanium sample; see docs/provenance-notes.md
 val FP_ITANIUM: u64 = 0x783769893F;
 
 rec Program {

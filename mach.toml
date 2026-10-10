@@ -1,6 +1,6 @@
 [project]
 id = "ramjet"
-version = "0.3.5"
+version = "0.3.6"
 mach = "^6.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"

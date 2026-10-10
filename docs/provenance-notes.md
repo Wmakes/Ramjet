@@ -1,4 +1,4 @@
-# Clean-room notes
+# Provenance notes
 
 Where every piece of format knowledge in Ramjet came from. The rule: nothing
 is taken from RAR, WinRAR or UnRAR source or binaries (no decompiling, no

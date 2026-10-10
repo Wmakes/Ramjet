@@ -16,7 +16,7 @@
 #
 # written from the format as The Unarchiver's XADMaster (LGPL-2.1) decodes
 # it, read only, and checked against archives RAR 2.50 made; see
-# docs/clean-room-notes.md.
+# docs/provenance-notes.md.
 
 use std.types.bool.bool;
 use std.types.bool.false;

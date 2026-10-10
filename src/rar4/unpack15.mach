@@ -11,7 +11,7 @@
 #
 # written from the format as The Unarchiver's XADMaster (LGPL-2.1) decodes
 # it, read only; the fixed code tables are restated here as runs of code
-# lengths. see docs/clean-room-notes.md.
+# lengths. see docs/provenance-notes.md.
 
 use std.types.bool.bool;
 use std.types.bool.false;

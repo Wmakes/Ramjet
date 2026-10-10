@@ -9,7 +9,7 @@
 #            with the CRC table after every block
 #
 # written from the format as The Unarchiver's XADMaster (LGPL-2.1) handles
-# it, read only; see docs/clean-room-notes.md. the substitution table is a
+# it, read only; see docs/provenance-notes.md. the substitution table is a
 # constant of the format.
 
 use std.types.bool.bool;

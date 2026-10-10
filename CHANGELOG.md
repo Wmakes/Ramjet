@@ -4,6 +4,12 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## 0.3.6 — 2026-10-10
+
+- Fix: in RAR 5 volumes encrypted with `-p` (file names not encrypted),
+  every file split across volumes failed its checksum although its data
+  was correct. RAR tweaks only the last part's checksum.
+
 ## 0.3.5 — 2026-10-10
 
 - Checksums (CRC32, BLAKE2sp) and file writes run on a second thread for
@@ -65,7 +71,7 @@ Fixes:
 
 ## 0.1.0 — 2026-10-09
 
-First release: a clean-room RAR reader.
+First release: a RAR reader.
 
 - RAR 5.0: every compression method, solid archives, delta and x86 filters,
   multi-volume sets, AES-256 for data and headers, CRC32 and BLAKE2sp.

@@ -1,6 +1,6 @@
 # Ramjet
 
-**Ramjet** is a fast, clean-room, RAR-compatible archiver written entirely in [Mach](https://machlang.org/). Like its namesake engine, it compresses with nothing but speed.
+**Ramjet** is a fast, independent RAR-compatible archiver written entirely in [Mach](https://machlang.org/). Like its namesake engine, it compresses with nothing but speed.
 
 The goal of Ramjet is to provide a modern, portable and fully open implementation of RAR-compatible archiving without relying on proprietary RAR/WinRAR source code.
 ## About
@@ -16,22 +16,15 @@ Ramjet is an independent implementation focused on:
 
 The project is written in **Mach**, a systems programming language designed around explicit control flow, explicit memory management and a small toolchain.
 
-## Clean-Room Implementation
+## Independent implementation
 
-Ramjet is developed as a **clean-room implementation**.
-
-This project does **not** use, include, copy, translate, or derive source code from:
-
-* RAR
-* WinRAR
-* UnRAR
-* proprietary RAR/WinRAR libraries
-* decompiled or disassembled source code
-* proprietary implementation details obtained from non-public sources
-
-The implementation is developed independently from publicly observable behavior, publicly available format information, interoperability testing, and independently produced specifications.
-
-The intention is to keep the Ramjet implementation independent from proprietary source code while providing interoperability with the RAR ecosystem where technically and legally possible.
+Ramjet is an independent implementation. It does not use, include, copy or
+translate source code from RAR, WinRAR, UnRAR or 7-Zip's RAR code, and uses
+no decompiled or disassembled code. Format knowledge comes from the public
+RARLAB technotes, from running `rar` as an ordinary program and checking its
+output, and from reading (without copying) the BSD-licensed libarchive and
+LGPL-licensed XADMaster RAR readers. `docs/provenance-notes.md` lists the
+source of each piece.
 ## Non-Goals
 
 Ramjet is not intended to:
@@ -63,7 +56,7 @@ Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what 
 
 Not yet: verified RAR 1.5 support, archives older than RAR 1.5, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
 
-See [`docs/clean-room-notes.md`](docs/clean-room-notes.md) for where every piece of format knowledge came from.
+See [`docs/provenance-notes.md`](docs/provenance-notes.md) for where every piece of format knowledge came from.
 
 ## Building
 
