@@ -41,7 +41,10 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
   `all_blake2_enc`.
 - **Per-volume hashes**: a part that continues in the next volume carries a
   CRC32 or BLAKE2sp of its *packed* bytes, not tweaked even when encrypted
-  (`volumes`, `volumes_solid_enc`).
+  (`volumes`, `volumes_solid_enc`). Only the last part's encryption record
+  sets the tweaked-checksum flag, for the file's own checksum, and only with
+  `-p`: with `-hp` checksums are never tweaked (`volumes_enc`,
+  `volumes_enc_blake2`).
 - **Header encryption across volumes**: every volume begins with its own
   plaintext archive encryption header.
 - **File versions** (`-ver`): older versions are listed as `name;N` and are

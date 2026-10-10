@@ -359,6 +359,12 @@ fun add_part(ar: *Archive, vi: usize, fh: *H.FileHeader, service: bool, split_be
             prev.h.data_crc   = fh.data_crc;
             prev.h.has_blake2 = fh.has_blake2;
             M.copy(?prev.h.blake2[0], ?fh.blake2[0], 32);
+            # only the final part's checksum is tweaked: earlier parts
+            # carry plain checksums of their packed bytes, so their
+            # encryption record does not set the flag
+            if (prev.h.crypt.present && fh.crypt.present) {
+                prev.h.crypt.flags = (prev.h.crypt.flags & ~H.CRYPT_HASHMAC) | (fh.crypt.flags & H.CRYPT_HASHMAC);
+            }
         }
     }
     or {

@@ -105,6 +105,11 @@ files=(big_random.bin)
 rr volumes            -m0 -v100k
 files=(text.txt random.bin)
 rr volumes_solid      -s -m3 -v20k
+# data-only encryption: only the last part's checksum is tweaked
+files=(big_random.bin)
+rr volumes_enc        -p"$pw" -m0 -v100k
+files=(text.txt random.bin)
+rr volumes_enc_blake2 -p"$pw" -htb -s -m3 -v20k
 
 files=(.)
 rr volumes_solid_enc  -s -hp"$pw" -htb -m3 -v60k -r "${nobig[@]}"

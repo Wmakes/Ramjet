@@ -79,6 +79,8 @@ check zeros_m5.rar files zeros.bin
 check dirs_only.rar files dir/sub/deep.txt dir/other.txt empty_dir
 check volumes.part1.rar files big_random.bin
 check volumes_solid.part01.rar files text.txt random.bin
+check volumes_enc.part1.rar files big_random.bin
+check volumes_enc_blake2.part01.rar files text.txt random.bin
 
 # unknown sizes in volumes: compare with the bytes that were piped in
 out="$work/stdin_volumes"; mkdir -p "$out"
