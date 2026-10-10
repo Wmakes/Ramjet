@@ -4,7 +4,7 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
-## Unreleased
+## 0.3.5 — 2026-10-10
 
 - Checksums (CRC32, BLAKE2sp) and file writes run on a second thread for
   files of 1 MB and more, overlapping with decompression.
