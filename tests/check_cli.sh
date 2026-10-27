@@ -31,6 +31,8 @@ expect "version"              0  "$ramjet" --version
 expect "no arguments"         7  "$ramjet"
 expect "unknown command"      7  "$ramjet" z "$s/all_m3.rar"
 expect "unknown switch"       7  "$ramjet" t -zz "$s/all_m3.rar"
+expect "v command alias"       0  "$ramjet" v "$s/all_m3.rar"
+expect "lta command alias"     0  "$ramjet" lta "$s/all_m3.rar"
 expect "missing archive"      6  "$ramjet" t "$work/none.rar"
 expect "not a rar"            2  "$ramjet" t "$in/hello.txt"
 expect "damaged data"         3  "$ramjet" t "$s/broken_crc.rar"
@@ -57,6 +59,37 @@ d="$work/list"
 got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
 [ "$got" = "./code.exe ./dir/other.txt " ] && ok "@listfile" || bad "@listfile: $got"
 
+d="$work/include"
+"$ramjet" x -inul -n'*.txt' -x'dir/*' -x'z*' "$s/all_m3.rar" "$d/"
+got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
+[ "$got" = "./empty.txt ./hardlink_hello.txt ./hello.txt ./text.txt " ] && ok "-n include mask" || bad "-n include mask: $got"
+
+d="$work/include_list"
+"$ramjet" x -inul -n@"$work/list.txt" "$s/all_m3.rar" "$d/"
+got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
+[ "$got" = "./code.exe ./dir/other.txt " ] && ok "-n@ include list" || bad "-n@ include list: $got"
+
+got=$("$ramjet" lb -n'*.txt' -x'dir/*' -x'z*' "$s/all_m3.rar" | sort | tr '\n' ' ')
+want="empty.txt hardlink_hello.txt hello.txt text.txt "
+[ "$got" = "$want" ] && ok "list commands honor filters" || bad "list commands honor filters: $got"
+
+d="$work/include_stdin"
+printf 'hello.txt\n' | "$ramjet" x -inul -n@ "$s/all_m3.rar" "$d/"
+[ -f "$d/hello.txt" ] && [ "$(find "$d" -type f | wc -l)" = 1 ] && ok "-n@ stdin list" || bad "-n@ stdin list"
+
+d="$work/exclude_stdin"
+printf 'dir/*\nz*\n' | "$ramjet" x -inul -n'*.txt' -x@ "$s/all_m3.rar" "$d/"
+got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
+[ "$got" = "./empty.txt ./hardlink_hello.txt ./hello.txt ./text.txt " ] && ok "-x@ stdin list" || bad "-x@ stdin list: $got"
+
+# disabling @list expansion makes the argument an ordinary file name
+expect "-@ disables lists"     10 "$ramjet" t -@ "$s/all_m3.rar" @"$work/list.txt"
+
+# a single dash ends switch scanning, so a dash-prefixed archive is accepted
+cp "$s/single_store.rar" "$work/-sample.rar"
+(cd "$work" && "$ramjet" t - -sample.rar >/dev/null 2>&1)
+[ $? = 0 ] && ok "single dash ends switches" || bad "single dash ends switches"
+
 # destinations
 d="$work/op"
 "$ramjet" x -inul -op"$d" "$s/single_store.rar"
@@ -68,6 +101,10 @@ d="$work/flat"
 "$ramjet" e -inul "$s/all_m3.rar" "dir/*" "$d/"
 got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
 [ "$got" = "./deep.txt ./other.txt " ] && ok "e drops paths" || bad "e drops paths: $got"
+d="$work/ep"
+"$ramjet" x -ep -inul "$s/all_m3.rar" "dir/*" "$d/"
+got=$(cd "$d" && find . -type f | sort | tr '\n' ' ')
+[ "$got" = "./deep.txt ./other.txt " ] && ok "-ep drops paths" || bad "-ep drops paths: $got"
 
 # existing files
 d="$work/exist"; mkdir -p "$d"
@@ -107,6 +144,8 @@ out=$("$ramjet" t -inul "$s/all_m3.rar" 2>&1)
 out=$("$ramjet" t -idq "$s/all_m3.rar" 2>&1)
 [ "$(echo "$out" | grep -c Testing)" = 0 ] && ok "-idq hides file lines" || bad "-idq hides file lines"
 [ "$("$ramjet" lb "$s/all_m3.rar" | wc -l)" = 17 ] && ok "lb lists bare names" || bad "lb lists bare names"
+out=$("$ramjet" l -c- "$s/all_comment.rar")
+! echo "$out" | grep -q '^Comment:$' && ok "-c- hides archive comment" || bad "-c- hides archive comment"
 "$ramjet" p "$s/single_store.rar" > "$work/p.out" 2>/dev/null
 cmp -s "$in/hello.txt" "$work/p.out" && ok "p prints only file data" || bad "p prints only file data"
 

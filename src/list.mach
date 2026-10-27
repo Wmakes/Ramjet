@@ -2,15 +2,33 @@
 
 use std.print;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
 use AR: ramjet.archive;
 use E:  ramjet.errors;
+use X:  ramjet.extract;
 use LT: ramjet.localtime;
 use M:  ramjet.mem;
 use H:  ramjet.rar5.header;
 use T:  ramjet.timefmt;
+
+fun selected(e: *AR.Entry, names: **u8, nnames: usize, excludes: **u8, nexcludes: usize) bool {
+    var i: usize = 0;
+    for (i < nexcludes) {
+        if (X.matches(excludes[i], e.name)) { ret false; }
+        i = i + 1;
+    }
+    if (nnames == 0) { ret true; }
+    i = 0;
+    for (i < nnames) {
+        if (X.matches(names[i], e.name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
 
 # ten-character mode string for a Unix host, attribute letters for Windows
 fun attr_string(e: *AR.Entry, out: *u8) {
@@ -106,7 +124,7 @@ fun ratio(unp: u64, packed: u64) u64 {
     ret packed * 100 / unp;
 }
 
-fun print_header(ar: *AR.Archive, archive: *u8) {
+fun print_header(ar: *AR.Archive, archive: *u8, show_comment: bool) {
     print.printf("Archive: {}\n", archive::str);
     if (ar.rar4)              { print.print("Details: RAR 4"); }
     or                        { print.print("Details: RAR 5"); }
@@ -116,7 +134,7 @@ fun print_header(ar: *AR.Archive, archive: *u8) {
     if (ar.locked)            { print.print(", lock"); }
     if (ar.encrypted_headers) { print.print(", encrypted headers"); }
     print.println("");
-    if (ar.comment != nil) {
+    if (show_comment && ar.comment != nil) {
         print.println("Comment:");
         var i:    usize = 0;
         var line: [2]u8;
@@ -149,19 +167,27 @@ fun print_damage(ar: *AR.Archive) i64 {
 }
 
 # one name per line, files and directories, nothing else
-fun list_bare(ar: *AR.Archive) i64 {
-    var i: usize = 0;
+fun list_bare(ar: *AR.Archive, names: **u8, nnames: usize, excludes: **u8, nexcludes: usize) i64 {
+    var i:     usize = 0;
+    var files: usize = 0;
     for (i < ar.entries.len) {
         val e: *AR.Entry = AR.entry(ar, i);
-        if (!e.service) { print.println(e.name::str); }
+        if (!e.service && selected(e, names, nnames, excludes, nexcludes)) {
+            print.println(e.name::str);
+            files = files + 1;
+        }
         i = i + 1;
     }
-    ret print_damage(ar);
+    val damage: i64 = print_damage(ar);
+    if (damage != 0)                                 { ret damage; }
+    if (files == 0 && (nnames > 0 || nexcludes > 0)) { ret E.exit_code(E.NO_FILES); }
+    ret 0;
 }
 
-pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool) i64 {
-    if (bare) { ret list_bare(ar); }
-    print_header(ar, archive);
+pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool, all_headers: bool, show_comment: bool,
+    names: **u8, nnames: usize, excludes: **u8, nexcludes: usize) i64 {
+    if (bare) { ret list_bare(ar, names, nnames, excludes, nexcludes); }
+    print_header(ar, archive, show_comment);
     var attr:         [11]u8;
     var total_unp:    u64 = 0;
     var total_packed: u64 = 0;
@@ -176,6 +202,18 @@ pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool) i64 {
     for (i < ar.entries.len) {
         val e:      *AR.Entry = AR.entry(ar, i);
         val packed: u64       = AR.packed_size(ar, e);
+        if (!e.service && !selected(e, names, nnames, excludes, nexcludes)) {
+            i = i + 1;
+            cnt;
+        }
+        if (e.service && !all_headers) {
+            i = i + 1;
+            cnt;
+        }
+        if (e.service && (nnames > 0 || nexcludes > 0)) {
+            i = i + 1;
+            cnt;
+        }
         if (e.service) {
             if (technical) {
                 print.printf("        Name: {}\n", e.name::str);
@@ -262,5 +300,8 @@ pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool) i64 {
         print.println(" ----------  ---------- ---------- -----");
         print.printf("             {:10} {:10} {:4}%  {} file(s)\n", total_unp, total_packed, ratio(total_unp, total_packed), files);
     }
-    ret print_damage(ar);
+    val damage: i64 = print_damage(ar);
+    if (damage != 0)                                 { ret damage; }
+    if (files == 0 && (nnames > 0 || nexcludes > 0)) { ret E.exit_code(E.NO_FILES); }
+    ret 0;
 }

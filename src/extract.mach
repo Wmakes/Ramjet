@@ -53,47 +53,64 @@ pub val QUIET_ALL:   u8 = 2;
 
 # what to do and how to talk about it
 # ---
-# mode:        MODE_TEST, MODE_EXTRACT, MODE_FLAT or MODE_PRINT
-# dest:        destination directory, or nil for the current one
-# overwrite:   what to do with files that already exist (OVERWRITE_*)
-# names:       masks selecting entries, all entries when nnames is 0
-# excludes:    masks of entries to leave out
-# quiet:       QUIET_NONE lists every file, QUIET_FILES only problems and the
-#              summary, QUIET_ALL nothing at all
-# versions:    also extract older file versions as name;N
-# keep_broken: keep files that failed their checksum instead of deleting them
-# progress:    show a percentage while large files are written
-# ask:         prompts are allowed (passwords, overwrites)
+# mode:          MODE_TEST, MODE_EXTRACT, MODE_FLAT or MODE_PRINT
+# dest:          destination directory, or nil for the current one
+# overwrite:     what to do with files that already exist (OVERWRITE_*)
+# names:         masks selecting entries, all entries when nnames is 0
+# excludes:      masks of entries to leave out
+# quiet:         QUIET_NONE lists every file, QUIET_FILES only problems and the
+#                summary, QUIET_ALL nothing at all
+# versions:      also extract older file versions as name;N
+# version_set:   extract only the older version numbered by version
+# strip_prefix:  archived path prefix removed by -ep4
+# keep_broken:   keep files that failed their checksum instead of deleting them
+# progress:      show a percentage while large files are written
+# ask:           prompts are allowed (passwords, overwrites)
+# restore_attrs: restore permission bits and Windows attributes
+# show_names:    show one report line per processed entry
+# summary:       show the final success or error count
 pub rec Options {
-    mode:        u8;
-    dest:        *u8;
-    overwrite:   u8;
-    names:       **u8;
-    nnames:      usize;
-    excludes:    **u8;
-    nexcludes:   usize;
-    quiet:       u8;
-    versions:    bool;
-    keep_broken: bool;
-    progress:    bool;
-    ask:         bool;
+    mode:          u8;
+    dest:          *u8;
+    overwrite:     u8;
+    names:         **u8;
+    nnames:        usize;
+    excludes:      **u8;
+    nexcludes:     usize;
+    quiet:         u8;
+    versions:      bool;
+    version_set:   bool;
+    version:       u64;
+    strip_prefix:  *u8;
+    keep_broken:   bool;
+    progress:      bool;
+    ask:           bool;
+    restore_attrs: bool;
+    show_names:    bool;
+    summary:       bool;
 }
 
 # options for internal decoding with no output and no questions
 pub fun silent_options() Options {
     var o: Options;
-    o.mode        = MODE_TEST;
-    o.dest        = nil;
-    o.overwrite   = OVERWRITE_SKIP;
-    o.names       = nil;
-    o.nnames      = 0;
-    o.excludes    = nil;
-    o.nexcludes   = 0;
-    o.quiet       = QUIET_ALL;
-    o.versions    = false;
-    o.keep_broken = false;
-    o.progress    = false;
-    o.ask         = false;
+    o.mode          = MODE_TEST;
+    o.dest          = nil;
+    o.overwrite     = OVERWRITE_SKIP;
+    o.names         = nil;
+    o.nnames        = 0;
+    o.excludes      = nil;
+    o.nexcludes     = 0;
+    o.quiet         = QUIET_ALL;
+    o.versions      = false;
+    o.version_set   = false;
+    o.version       = 0;
+    o.strip_prefix  = nil;
+    o.keep_broken   = false;
+    o.progress      = false;
+    o.ask           = false;
+    o.restore_attrs = true;
+    o.show_names    = false;
+    o.summary       = false;
     ret o;
 }
 
@@ -141,7 +158,7 @@ rec State {
 
 # ---------------------------------------------------------------- names
 
-fun matches(pattern: *u8, name: *u8) bool {
+pub fun matches(pattern: *u8, name: *u8) bool {
     # '*' matches any run, '?' one byte; a pattern also selects everything
     # under a directory of that name
     var p:      usize = 0;
@@ -222,6 +239,24 @@ fun reserved_device(p: *u8, len: usize) bool {
     ret false;
 }
 
+fun prefix_len(prefix: *u8) usize {
+    if (prefix == nil) { ret 0; }
+    var n: usize = M.cstr_len(prefix);
+    for (n > 0 && (prefix[n - 1] == '/' || prefix[n - 1] == '\\')) { n = n - 1; }
+    ret n;
+}
+
+fun prefix_equal(name: *u8, prefix: *u8) bool {
+    val pn: usize = prefix_len(prefix);
+    if (pn == 0 || M.cstr_len(name) != pn) { ret false; }
+    var i: usize = 0;
+    for (i < pn) {
+        if (name[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
 # a relative, normalized path for an archived name, or nil when unsafe
 #
 # components are split on every separator of the extracting system, so a
@@ -229,11 +264,31 @@ fun reserved_device(p: *u8, len: usize) bool {
 # dots and spaces (which Windows drops, turning ".. " into "..") and the
 # characters :*?"<>| are replaced, and device names get a leading '_'.
 # ---
-# flat: keep only the last component
-fun safe_name(e: *AR.Entry, flat: bool) *u8 {
-    val src: *u8   = e.name;
-    val n:   usize = M.cstr_len(src);
-    val out: *u8   = M.alloc(n + 2 * (n / 2 + 1) + 1);
+# flat:          keep only the last component
+# strip_prefix:  remove this exact leading path and its separator
+# strip_version: remove the generated ;N suffix of an older file version
+fun safe_name(e: *AR.Entry, flat: bool, strip_prefix: *u8, strip_version: bool) *u8 {
+    var src: *u8   = e.name;
+    var n:   usize = M.cstr_len(src);
+    if (strip_prefix != nil && strip_prefix[0] != 0) {
+        val pn:   usize = prefix_len(strip_prefix);
+        var same: bool  = pn > 0 && pn < n && src[pn] == '/';
+        var k:    usize = 0;
+        for (same && k < pn) {
+            if (src[k] != strip_prefix[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) {
+            src = ?src[pn + 1];
+            n   = n - pn - 1;
+        }
+    }
+    if (strip_version && e.h.file_version != 0) {
+        var cut: usize = n;
+        for (cut > 0 && src[cut - 1] != ';') { cut = cut - 1; }
+        if (cut > 0) { n = cut - 1; }
+    }
+    val out: *u8 = M.alloc(n + 2 * (n / 2 + 1) + 1);
     if (out == nil) { ret nil; }
     var o: usize = 0;
     var i: usize = 0;
@@ -492,7 +547,7 @@ fun report(st: *State, verb: str, e: *AR.Entry, rc: E.Code) {
     val pad: bool = st.prog_shown;
     if (rc == E.OK) {
         st.done = st.done + 1;
-        if (st.opt.quiet == QUIET_NONE && st.opt.mode != MODE_PRINT) {
+        if (st.opt.quiet == QUIET_NONE && st.opt.show_names && st.opt.mode != MODE_PRINT) {
             end_progress(st);
             # spaces cover the percentage the progress line showed
             if (pad) { print.printf("{:<11} {}  OK   \n", verb, e.name::str); }
@@ -511,7 +566,7 @@ fun report(st: *State, verb: str, e: *AR.Entry, rc: E.Code) {
 
 fun note_skip(st: *State, e: *AR.Entry, why: str) {
     st.skipped = st.skipped + 1;
-    if (st.opt.quiet == QUIET_NONE) { print.printf("{:<11} {}  {}\n", "Skipping", e.name::str, why); }
+    if (st.opt.quiet == QUIET_NONE && st.opt.show_names) { print.printf("{:<11} {}  {}\n", "Skipping", e.name::str, why); }
 }
 
 # ask for a password at the terminal; false when nobody can be asked
@@ -634,8 +689,8 @@ fun existing(st: *State, path: **u8) u8 {
     ret SKIP_IT;
 }
 
-fun apply_metadata(e: *AR.Entry, path: *u8) {
-    if (e.h.host_os == H.HOST_UNIX) {
+fun apply_metadata(e: *AR.Entry, path: *u8, restore_attrs: bool) {
+    if (restore_attrs && e.h.host_os == H.HOST_UNIX) {
         # permission bits, without set-id bits from an untrusted archive
         P.set_mode(path, (e.h.attr & 0x3FF)::i32);
     }
@@ -645,7 +700,7 @@ fun apply_metadata(e: *AR.Entry, path: *u8) {
         P.set_times(path, at.sec, at.nsec, e.h.mtime.sec, e.h.mtime.nsec);
     }
     # attributes last: a read-only file cannot get its times set after
-    if (e.h.host_os == H.HOST_WINDOWS) { P.set_attributes(path, e.h.attr::u32); }
+    if (restore_attrs && e.h.host_os == H.HOST_WINDOWS) { P.set_attributes(path, e.h.attr::u32); }
 }
 
 fun write_file(st: *State, e: *AR.Entry, path: *u8) E.Code {
@@ -655,7 +710,7 @@ fun write_file(st: *State, e: *AR.Entry, path: *u8) E.Code {
     var f:    fs.File = fr.ok;
     var sink: S.Sink;
     S.sink_init(?sink, S.SINK_FD, f.handle.value, e.h.has_blake2);
-    if (st.opt.progress && st.opt.quiet == QUIET_NONE) { S.sink_progress(?sink, "Extracting", e.name, e.h.unp_size); }
+    if (st.opt.progress && st.opt.quiet == QUIET_NONE && st.opt.show_names) { S.sink_progress(?sink, "Extracting", e.name, e.h.unp_size); }
     val rc: E.Code = unpack_entry(st, e, ?sink);
     st.prog_shown = sink.prog_shown;
     fs.close(?f);
@@ -669,7 +724,7 @@ fun write_file(st: *State, e: *AR.Entry, path: *u8) E.Code {
         ret rc;
     }
     st.bytes = st.bytes + sink.written;
-    apply_metadata(e, path);
+    apply_metadata(e, path, st.opt.restore_attrs);
     ret E.OK;
 }
 
@@ -743,7 +798,7 @@ fun extract_link(st: *State, e: *AR.Entry, i: usize, path: *u8) E.Code {
     # be inside the destination like any other name
     var ref: AR.Entry = @e;
     ref.name = e.link;
-    val rel: *u8 = safe_name(?ref, false);
+    val rel: *u8 = safe_name(?ref, false, nil, false);
     if (rel == nil) { ret E.UNSAFE_PATH; }
     val target: *u8 = join(st.opt.dest, rel);
     if (target == nil)                                           { ret E.NO_MEMORY; }
@@ -751,7 +806,7 @@ fun extract_link(st: *State, e: *AR.Entry, i: usize, path: *u8) E.Code {
     if (t == H.REDIR_HARDLINK && P.hard_link(target, path) == 0) { ret E.OK; }
     if (t == H.REDIR_HARDLINK || t == H.REDIR_FILECOPY) {
         val rc: E.Code = copy_file(target, path);
-        if (rc == E.OK) { apply_metadata(e, path); }
+        if (rc == E.OK) { apply_metadata(e, path, st.opt.restore_attrs); }
         ret rc;
     }
     ret E.UNSUPPORTED;
@@ -779,7 +834,7 @@ fun finish_links(st: *State) {
     for (i > 0) {
         i = i - 1;
         val d: *Deferred = ?st.dirs.data[i];
-        apply_metadata(AR.entry(st.ar, d.entry), d.path);
+        apply_metadata(AR.entry(st.ar, d.entry), d.path, st.opt.restore_attrs);
     }
 }
 
@@ -811,8 +866,11 @@ fun process(st: *State, i: usize) {
     val ar: *AR.Archive = st.ar;
     val e:  *AR.Entry   = AR.entry(ar, i);
     if (e.service) { ret; }
-    # older file versions are extracted only on request, as "name;N"
-    val want: bool = selected(st, e) && (st.opt.versions || e.h.file_version == 0);
+    # older versions are normally skipped; -ver extracts all as name;N and
+    # -verN extracts only version N under the unversioned name
+    var wanted_version: bool = st.opt.versions || e.h.file_version == 0;
+    if (st.opt.version_set) { wanted_version = e.h.file_version == st.opt.version; }
+    val want: bool = selected(st, e) && wanted_version;
     val mode: u8   = st.opt.mode;
 
     if (!want) {
@@ -839,7 +897,7 @@ fun process(st: *State, i: usize) {
         }
         or {
             S.sink_init(?sink, S.SINK_DISCARD, 0, e.h.has_blake2);
-            if (st.opt.progress && st.opt.quiet == QUIET_NONE) { S.sink_progress(?sink, "Testing", e.name, e.h.unp_size); }
+            if (st.opt.progress && st.opt.quiet == QUIET_NONE && st.opt.show_names) { S.sink_progress(?sink, "Testing", e.name, e.h.unp_size); }
         }
         val rc: E.Code = unpack_entry(st, e, ?sink);
         st.prog_shown = sink.prog_shown;
@@ -849,8 +907,9 @@ fun process(st: *State, i: usize) {
         ret;
     }
 
-    if (mode == MODE_FLAT && AR.is_dir(e)) { ret; }
-    val rel: *u8 = safe_name(e, mode == MODE_FLAT);
+    if (mode == MODE_FLAT && AR.is_dir(e))                         { ret; }
+    if (AR.is_dir(e) && prefix_equal(e.name, st.opt.strip_prefix)) { ret; }
+    val rel: *u8 = safe_name(e, mode == MODE_FLAT, st.opt.strip_prefix, st.opt.version_set);
     if (rel == nil) {
         report(st, "Extracting", e, E.UNSAFE_PATH);
         skip_data(st, i);
@@ -1004,13 +1063,13 @@ pub fun run(ar: *AR.Archive, opt: *Options) i64 {
         if (loud) { print.eprintln("ramjet: stopped"); }
         ret E.exit_code(E.USER_BREAK);
     }
-    if (st.matched == 0 && (opt.nnames > 0 || opt.nexcludes > 0)) {
+    if (st.matched == 0 && (opt.nnames > 0 || opt.nexcludes > 0 || opt.version_set)) {
         if (loud)             { print.eprintln("ramjet: no files matched"); }
         if (st.worst == E.OK) { st.worst = E.NO_FILES; }
         ret E.exit_code(st.worst);
     }
 
-    if (loud && opt.mode != MODE_PRINT) {
+    if (loud && opt.summary && opt.mode != MODE_PRINT) {
         val ms: i64 = TT.millis() - started;
         if (st.errors > 0) {
             print.eprintf("{} error(s)", st.errors);

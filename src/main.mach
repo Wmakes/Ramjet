@@ -2,12 +2,14 @@
 #
 #   ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]
 #
-# switches may appear anywhere until "--". a last argument ending in a path
+# switches may appear anywhere until "-" ("--" is accepted too). a last argument ending in a path
 # separator is the destination of x and e; other arguments after the archive
 # select files by name or mask.
 
+use std.input;
 use std.print;
 use std.runtime;
+use NP: std.text.parse;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -35,9 +37,10 @@ fun usage() {
     print.println("usage: ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]");
     print.println("");
     print.println("commands:");
-    print.println("  l             list archive contents");
-    print.println("  lt            list with technical details");
-    print.println("  lb            list bare file names");
+    print.println("  l, v          list archive contents");
+    print.println("  lt, vt        list technical details");
+    print.println("  lta, vta      technical listing including service records");
+    print.println("  lb, vb        list bare file names");
     print.println("  t             test archive files");
     print.println("  x             extract files with full paths");
     print.println("  e             extract files without paths");
@@ -50,14 +53,21 @@ fun usage() {
     print.println("  -or           rename extracted files when the name exists");
     print.println("  -y            assume yes on all questions");
     print.println("  -x<mask>      exclude files (repeatable; -x@<file> reads masks from a file)");
+    print.println("  -n<mask>      include files (repeatable; -n@<file> reads masks from a file)");
+    print.println("  -@, -@+       treat @file literally / expand it as a file list");
     print.println("  -op<path>     extract into this directory");
-    print.println("  -ad           extract into a directory named after the archive");
+    print.println("  -ad[1,2]      choose an archive-named or archive-local destination");
+    print.println("  -ep           discard archived paths while extracting");
+    print.println("  -ep4<path>    remove an exact leading path from extracted names");
+    print.println("  -ai           do not restore archived file attributes");
+    print.println("  -c-           hide the archive comment in listings");
     print.println("  -kb           keep files that failed their checksum");
-    print.println("  -ver          also extract older file versions as name;N");
+    print.println("  -ver[N]       extract all older versions, or only version N");
+    print.println("  -idc/d/n/p/q  suppress selected output details");
     print.println("  -idq, -q      only show errors and the summary");
     print.println("  -inul         show nothing");
     print.println("  -idp          no progress percentage");
-    print.println("  --            stop reading switches");
+    print.println("  -             stop reading switches (-- works too)");
     print.println("  -h, --help    this help;  --version  version");
     print.println("");
     print.println("exit status: 0 ok, 1 warning, 2 fatal error, 3 damaged data, 5 write error,");
@@ -107,6 +117,22 @@ fun read_list(path: *u8, v: *Vector[*u8]) bool {
     ret true;
 }
 
+# append a list read from standard input, one name or mask per line
+fun read_stdin_list(v: *Vector[*u8]) bool {
+    var line: [4096]u8;
+    for {
+        val r: res[usize, input.InputError] = input.read_line(?line[0], 4096);
+        if (sel r.err) {
+            if (sel r.err.read) {
+                if (sel r.err.read.eof) { ret true; }
+            }
+            ret false;
+        }
+        if (r.ok > 0) { V.push[*u8](v, M.dup(?line[0], r.ok)); }
+    }
+    ret true;
+}
+
 # the archive's base name without its .rar / .partN.rar extension, for -ad
 fun archive_stem(path: *u8) *u8 {
     val n:     usize = M.cstr_len(path);
@@ -143,6 +169,15 @@ fun join_dir(a: *u8, b: *u8) *u8 {
     out[o + bn]     = '/';
     out[o + bn + 1] = 0;
     ret out;
+}
+
+# directory containing an archive path, or "." for a bare file name
+fun archive_dir(path: *u8) *u8 {
+    val n: usize = M.cstr_len(path);
+    var i: usize = n;
+    for (i > 0 && !is_sep(path[i - 1])) { i = i - 1; }
+    if (i == 0) { ret M.dup("."::*u8, 1); }
+    ret M.dup(path, i);
 }
 
 # open the archive, asking for the password of encrypted headers
@@ -183,16 +218,22 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 0;
     }
 
-    var mode:      u8   = 0;
-    var list:      bool = false;
-    var technical: bool = false;
-    var bare:      bool = false;
-    if (M.cstr_eq(cmd, "l"::*u8)) { list = true; }
-    or (M.cstr_eq(cmd, "lt"::*u8)) {
+    var mode:        u8   = 0;
+    var list:        bool = false;
+    var technical:   bool = false;
+    var bare:        bool = false;
+    var all_headers: bool = false;
+    if (M.cstr_eq(cmd, "l"::*u8) || M.cstr_eq(cmd, "v"::*u8)) { list = true; }
+    or (M.cstr_eq(cmd, "lt"::*u8) || M.cstr_eq(cmd, "vt"::*u8)) {
         list      = true;
         technical = true;
     }
-    or (M.cstr_eq(cmd, "lb"::*u8)) {
+    or (M.cstr_eq(cmd, "lta"::*u8) || M.cstr_eq(cmd, "vta"::*u8)) {
+        list        = true;
+        technical   = true;
+        all_headers = true;
+    }
+    or (M.cstr_eq(cmd, "lb"::*u8) || M.cstr_eq(cmd, "vb"::*u8)) {
         list = true;
         bare = true;
     }
@@ -203,48 +244,100 @@ fun main(argc: i64, argv: **u8) i64 {
     or                            { ret bad_usage("unknown command", cmd); }
 
     var opt: X.Options = X.silent_options();
-    opt.mode     = mode;
-    opt.quiet    = X.QUIET_NONE;
-    opt.progress = TT.is_terminal(1) && mode != X.MODE_PRINT;
-    opt.ask      = true;
+    opt.mode       = mode;
+    opt.quiet      = X.QUIET_NONE;
+    opt.progress   = TT.is_terminal(1) && mode != X.MODE_PRINT;
+    opt.ask        = true;
+    opt.show_names = true;
+    opt.summary    = true;
     # without a terminal there is nobody to ask, so existing files are kept
     opt.overwrite = X.OVERWRITE_SKIP;
     if (TT.available()) { opt.overwrite = X.OVERWRITE_ASK; }
 
-    var password:   *u8         = nil;
-    var ask_now:    bool        = false;
-    var archive:    *u8         = nil;
-    var out_path:   *u8         = nil;
-    var by_archive: bool        = false;
-    var names:      Vector[*u8] = V.init[*u8](M.allocator());
-    var excludes:   Vector[*u8] = V.init[*u8](M.allocator());
-    var rest:       Vector[*u8] = V.init[*u8](M.allocator());
-    var switches:   bool        = true;
+    var password:     *u8         = nil;
+    var ask_now:      bool        = false;
+    var archive:      *u8         = nil;
+    var out_path:     *u8         = nil;
+    var ad_mode:      u8          = 0;
+    var show_comment: bool        = true;
+    var expand_lists: bool        = true;
+    var names:        Vector[*u8] = V.init[*u8](M.allocator());
+    var excludes:     Vector[*u8] = V.init[*u8](M.allocator());
+    var rest:         Vector[*u8] = V.init[*u8](M.allocator());
+    var switches:     bool        = true;
 
     var i: i64 = 2;
     for (i < argc) {
         val a: *u8 = argv[i];
         i = i + 1;
+        if (switches && M.cstr_eq(a, "-"::*u8)) {
+            switches = false;
+            cnt;
+        }
         if (switches && a[0] == '-' && a[1] != 0) {
             if (M.cstr_eq(a, "--"::*u8))                             { switches = false; }
+            or (M.cstr_eq(a, "-@"::*u8) || M.cstr_eq(a, "-@-"::*u8)) { expand_lists = false; }
+            or (M.cstr_eq(a, "-@+"::*u8))                            { expand_lists = true; }
             or (M.cstr_eq(a, "-p-"::*u8))                            { opt.ask = false; }
             or (M.cstr_eq(a, "-p"::*u8))                             { ask_now = true; }
             or (a[1] == 'p' && a[2] != 0 && !starts(a, "-op"))       { password = ?a[2]; }
             or (M.cstr_eq(a, "-o+"::*u8) || M.cstr_eq(a, "-y"::*u8)) { opt.overwrite = X.OVERWRITE_ALL; }
             or (M.cstr_eq(a, "-o-"::*u8))                            { opt.overwrite = X.OVERWRITE_SKIP; }
             or (M.cstr_eq(a, "-or"::*u8))                            { opt.overwrite = X.OVERWRITE_RENAME; }
+            or (M.cstr_eq(a, "-x@"::*u8)) {
+                if (!read_stdin_list(?excludes)) { ret bad_usage("cannot read exclusion list from stdin", a); }
+            }
             or (starts(a, "-x@") && a[3] != 0) {
                 if (!read_list(?a[3], ?excludes)) { ret bad_usage("cannot read list file", ?a[3]); }
             }
-            or (a[1] == 'x' && a[2] != 0)                             { V.push[*u8](?excludes, ?a[2]); }
-            or (starts(a, "-op") && a[3] != 0)                        { out_path = ?a[3]; }
-            or (M.cstr_eq(a, "-ad"::*u8))                             { by_archive = true; }
-            or (M.cstr_eq(a, "-kb"::*u8))                             { opt.keep_broken = true; }
-            or (M.cstr_eq(a, "-ver"::*u8))                            { opt.versions = true; }
-            or (M.cstr_eq(a, "-idq"::*u8) || M.cstr_eq(a, "-q"::*u8)) { opt.quiet = X.QUIET_FILES; }
-            or (M.cstr_eq(a, "-inul"::*u8))                           { opt.quiet = X.QUIET_ALL; }
-            or (M.cstr_eq(a, "-idp"::*u8))                            { opt.progress = false; }
-            or                                                        { ret bad_usage("unknown switch", a); }
+            or (a[1] == 'x' && a[2] != 0) { V.push[*u8](?excludes, ?a[2]); }
+            or (M.cstr_eq(a, "-n@"::*u8)) {
+                if (!read_stdin_list(?names)) { ret bad_usage("cannot read inclusion list from stdin", a); }
+            }
+            or (starts(a, "-n@") && a[3] != 0) {
+                if (!read_list(?a[3], ?names)) { ret bad_usage("cannot read list file", ?a[3]); }
+            }
+            or (a[1] == 'n' && a[2] != 0)      { V.push[*u8](?names, ?a[2]); }
+            or (starts(a, "-op") && a[3] != 0) { out_path = ?a[3]; }
+            or (M.cstr_eq(a, "-ad"::*u8))      { ad_mode = 1; }
+            or (M.cstr_eq(a, "-ad1"::*u8))     { ad_mode = 2; }
+            or (M.cstr_eq(a, "-ad2"::*u8))     { ad_mode = 3; }
+            or (M.cstr_eq(a, "-ep"::*u8)) {
+                if (opt.mode == X.MODE_EXTRACT) { opt.mode = X.MODE_FLAT; }
+            }
+            # Observed to leave extraction paths unchanged in Linux UnRAR 7.23.
+            or (M.cstr_eq(a, "-ep3"::*u8))      {}
+            or (starts(a, "-ep4") && a[4] != 0) { opt.strip_prefix = ?a[4]; }
+            or (M.cstr_eq(a, "-ai"::*u8))       { opt.restore_attrs = false; }
+            or (M.cstr_eq(a, "-c-"::*u8))       { show_comment = false; }
+            # Ramjet has no configuration files, already follows archive
+            # volumes, and recursively matches selected directories.
+            or (M.cstr_eq(a, "-cfg-"::*u8) || M.cstr_eq(a, "-v"::*u8) || M.cstr_eq(a, "-r"::*u8) ||
+                M.cstr_eq(a, "-ol"::*u8)) {}
+            or (M.cstr_eq(a, "-kb"::*u8))  { opt.keep_broken = true; }
+            or (M.cstr_eq(a, "-ver"::*u8)) { opt.versions = true; }
+            or (starts(a, "-ver") && a[4] != 0) {
+                val parsed: res[u64, NP.ParseError] = NP.parse_u64_exact((?a[4])::str, 10);
+                if (sel parsed.err) { ret bad_usage("invalid version switch", a); }
+                if (parsed.ok == 0) {
+                    opt.versions = true;
+                }
+                or {
+                    opt.version_set = true;
+                    opt.version     = parsed.ok;
+                }
+            }
+            # Ramjet has no startup copyright banner, so -idc is already true.
+            or (M.cstr_eq(a, "-idc"::*u8)) {}
+            or (M.cstr_eq(a, "-idd"::*u8)) { opt.summary = false; }
+            or (M.cstr_eq(a, "-idn"::*u8)) { opt.show_names = false; }
+            or (M.cstr_eq(a, "-idq"::*u8) || M.cstr_eq(a, "-q"::*u8)) {
+                opt.quiet   = X.QUIET_FILES;
+                opt.summary = false;
+            }
+            or (M.cstr_eq(a, "-inul"::*u8)) { opt.quiet = X.QUIET_ALL; }
+            or (M.cstr_eq(a, "-idp"::*u8))  { opt.progress = false; }
+            or                              { ret bad_usage("unknown switch", a); }
             cnt;
         }
         if (archive == nil) {
@@ -266,11 +359,13 @@ fun main(argc: i64, argv: **u8) i64 {
         }
     }
     if (out_path != nil) { opt.dest = out_path; }
-    if (by_archive)      { opt.dest = join_dir(opt.dest, archive_stem(archive)); }
+    if (ad_mode == 1)    { opt.dest = join_dir(opt.dest, archive_stem(archive)); }
+    or (ad_mode == 2)    { opt.dest = join_dir(archive_dir(archive), archive_stem(archive)); }
+    or (ad_mode == 3)    { opt.dest = archive_dir(archive); }
     var k: usize = 0;
     for (k < rest.len) {
         val a: *u8 = rest.data[k];
-        if (a[0] == '@' && a[1] != 0) {
+        if (expand_lists && a[0] == '@' && a[1] != 0) {
             if (!read_list(?a[1], ?names)) { ret bad_usage("cannot read list file", ?a[1]); }
         }
         or { V.push[*u8](?names, a); }
@@ -296,8 +391,8 @@ fun main(argc: i64, argv: **u8) i64 {
 
     var status: i64 = 0;
     if (list) {
-        X.load_comment(?ar);
-        status = L.list(?ar, archive, technical, bare);
+        if (show_comment) { X.load_comment(?ar); }
+        status = L.list(?ar, archive, technical, bare, all_headers, show_comment, opt.names, opt.nnames, opt.excludes, opt.nexcludes);
     }
     or {
         status = X.run(?ar, ?opt);
