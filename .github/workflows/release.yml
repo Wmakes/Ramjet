@@ -1,0 +1,155 @@
+name: Release
+
+# manual: Actions tab -> Release -> Run workflow. you type the version.
+# cross-compiles ramjet for all 5 targets on one Linux runner, packages each with Readme + LICENSE +
+# THIRD_PARTY_NOTICES.txt, and either leaves the files as downloadable
+# artifacts or publishes them straight to a GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 0.3.7 (no leading v)"
+        required: true
+        type: string
+      publish:
+        description: "Publish to GitHub Releases (off = only downloadable artifacts)"
+        required: true
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: true
+        type: boolean
+        default: false
+      mach_version:
+        description: "Mach compiler version, e.g. 6.10.1 (empty = latest)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build all targets (cross-compiled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: fetch std tags
+        run: |
+          # the submodule is a shallow clone with no tags; mach needs them to check std's version
+          git -C dep/std fetch --unshallow --tags --force || git -C dep/std fetch --tags --force
+          git -C dep/std tag | tail -3
+
+      - name: validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]] || { echo "::error::bad version '$VERSION' (want e.g. 0.3.7)"; exit 1; }
+
+      - name: set version in mach.toml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # ramjet --version reads [project].version at build time
+          sed -i -E '0,/^version = ".*"/s//version = "'"$VERSION"'"/' mach.toml
+          grep -m1 '^version' mach.toml
+
+      - name: install mach
+        env:
+          MACH_VERSION: ${{ inputs.mach_version }}
+        run: |
+          base=https://github.com/briar-systems/mach/releases
+          if [ -n "$MACH_VERSION" ]; then
+            ver="${MACH_VERSION#v}"
+          else
+            tag=$(curl -fsSI "$base/latest" | tr -d '\r' | grep -i '^location:' | sed 's|.*/tag/||')
+            ver="${tag#v}"
+          fi
+          [ -n "$ver" ] || { echo "::error::could not resolve mach version"; exit 1; }
+          f="mach-$ver-x86_64-linux.tar.gz"
+          dest="$RUNNER_TEMP/mach-bin"; dl="$RUNNER_TEMP/mach-dl"
+          mkdir -p "$dest" "$dl"
+          curl -fsSL -o "$dl/$f" "$base/download/v$ver/$f"
+          curl -fsSL -o "$dl/SHA256SUMS" "$base/download/v$ver/SHA256SUMS"
+          (cd "$dl" && grep " $f\$" SHA256SUMS | sha256sum -c -)
+          tar -xzf "$dl/$f" -C "$dest"
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: build and package every target
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mach info
+          mkdir -p dist
+          # release-file suffix : target name in mach.toml
+          for pair in linux-x86_64:linux-x86_64 linux-aarch64:linux-arm64 \
+                      windows-x86_64:windows-x86_64 darwin-aarch64:darwin-aarch64 darwin-x86_64:darwin-x86_64; do
+            name=${pair%%:*}; target=${pair##*:}
+            echo "::group::$name"
+            mach build . -t "$target" -p release
+            exe=ramjet; case "$name" in windows-*) exe=ramjet.exe ;; esac
+            bin="out/$target/release/bin/$exe"
+            [ -f "$bin" ] || { echo "::error::missing $bin"; find out -type f; exit 1; }
+            pkg="ramjet-$VERSION-$name"
+            rm -rf "$pkg"; mkdir -p "$pkg"
+            cp "$bin" "$pkg/"
+            cp Readme.md LICENSE THIRD_PARTY_NOTICES.txt "$pkg/"
+            case "$name" in
+              windows-*) zip -qr "dist/$pkg.zip" "$pkg" ;;
+              *) chmod +x "$pkg/$exe"; tar -czf "dist/$pkg.tar.gz" "$pkg" ;;
+            esac
+            echo "::endgroup::"
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ramjet-${{ inputs.version }}
+          path: dist/ramjet-*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ramjet-*
+          path: dist
+          merge-multiple: true
+
+      - name: check all 5 files are present
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd dist
+          for s in darwin-aarch64 darwin-x86_64 linux-aarch64 linux-x86_64; do
+            [ -f "ramjet-$VERSION-$s.tar.gz" ] || { echo "::error::missing $s"; exit 1; }
+          done
+          [ -f "ramjet-$VERSION-windows-x86_64.zip" ] || { echo "::error::missing windows"; exit 1; }
+          ls -l
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Ramjet ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/ramjet-*
