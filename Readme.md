@@ -104,10 +104,11 @@ The sample archives are not part of the repository: they are made on your machin
 ```
 mach test .                          unit tests
 tests/gen_samples.sh                 rebuild the RAR 5 samples (needs the rar tool)
-tests/get_rar4.sh                    download RAR 4.20 (git-ignored) for the RAR 4 samples
-tests/gen_samples_rar4.sh            rebuild the RAR 4 samples
+tests/gen_samples_rar4.sh /path/to/rar-4.20
+                                      rebuild RAR 4 samples with your own executable
 tests/gen_samples_rar2.sh            rebuild the RAR 2.0 samples (needs rar250.exe and dosbox)
-tests/gen_samples_rar3.sh            rebuild the RAR 3.x encryption samples (downloads pinned RAR 3.x packages)
+tests/gen_samples_rar3.sh <3.00> <3.41> <3.50>
+                                      rebuild RAR 3.x samples with your own executables
 tests/check_extract.sh               extract every sample and compare with its source files
 tests/check_cli.sh                   command-line behavior and exit codes
 tests/compare_list.py [bin] [dir]    compare `ramjet lt` with `rar lt` (dir: tests/samples/rar4 for RAR 4)

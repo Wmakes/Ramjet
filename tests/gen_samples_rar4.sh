@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Generate RAR 4.x sample archives with the RAR 4.20 binary fetched by
-# tests/get_rar4.sh. Inputs are the files tests/gen_samples.sh made in
-# tests/samples/input, so run that first.
+# Generate RAR 4.x sample archives with a user-supplied RAR 4.20 binary.
+# Inputs are the files tests/gen_samples.sh made in tests/samples/input, so
+# run that first. This script never downloads or installs RAR.
 #
 # The binary is run as an ordinary program; it is never decompiled.
 #
-# Usage: tests/gen_samples_rar4.sh
+# Usage: tests/gen_samples_rar4.sh /path/to/rar-4.20
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")" && pwd)"
-rar4="$root/rar4/rar/rar"
 in="$root/samples/input"
 out="$root/samples/rar4"
 pw="ramjet"
 
-[ -x "$rar4" ] || { echo "run tests/get_rar4.sh first" >&2; exit 1; }
+[ "$#" -eq 1 ] || { echo "usage: $0 /path/to/rar-4.20" >&2; exit 1; }
+case "$1" in
+    /*) rar4="$1" ;;
+    *)  rar4="$PWD/$1" ;;
+esac
+[ -x "$rar4" ] || { echo "RAR 4.20 executable not found: $1" >&2; exit 1; }
 [ -d "$in" ] || { echo "run tests/gen_samples.sh first" >&2; exit 1; }
 rm -rf "$out"
 mkdir -p "$out"

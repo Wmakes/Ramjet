@@ -1,7 +1,7 @@
 # RAR 1.5-4.x block headers
 #
 # layout follows "RAR version 4.20 - Technical information" (technote.txt in
-# the RAR 4.20 package, fetched by tests/get_rar4.sh; not redistributed).
+# a user-supplied RAR 4.20 package; not downloaded or redistributed).
 # what that document leaves out was worked out from archives made by RAR
 # 4.20 (tests/samples/rar4): the extended time record, the compact Unicode
 # name encoding, the service (0x7a) and end-of-archive (0x7b) blocks.
