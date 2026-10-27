@@ -4,6 +4,29 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## 0.3.7 — 2026-10-27
+
+- Reader switches modeled on observed UnRAR 7.23 behavior (it was run as an
+  ordinary program against synthetic archives; no UnRAR source was used):
+  - command aliases `v`, `vt`, `lta`, `vta`, `lb`, `vb`
+  - `-n<mask>` include masks, `-n@<file>` / `-x@<file>` mask lists
+    (`@` alone reads from stdin), and `-@` / `-@+` to treat `@file`
+    literally or as a file list
+  - list commands honor the include and exclude filters
+  - `-ep` and `-ep4<path>` to drop or trim archived paths on extract
+  - `-ad[1,2]` archive-named / archive-local destinations
+  - `-ver[N]` to extract all older file versions or only version N
+  - `-ai` to skip restoring archived attributes, `-c-` to hide the archive
+    comment, `-idc/d/n/p/q` to suppress selected output
+  - a single `-` (or `--`) ends switch scanning
+  - matching exit code when no files match
+- New build targets: `darwin-aarch64` and `linux-arm64`. They build but are not
+  tested yet, like the other macOS target.
+- The sample generators no longer download proprietary RAR binaries. You pass
+  your own RAR 3.x / 4.20 executables to `tests/gen_samples_rar3.sh` and
+  `tests/gen_samples_rar4.sh`; `tests/get_rar4.sh` is removed.
+- Readme: badges, project description, and a note on untested targets.
+
 ## 0.3.6 — 2026-10-10
 
 - Fix: in RAR 5 volumes encrypted with `-p` (file names not encrypted),
