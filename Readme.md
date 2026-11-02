@@ -39,7 +39,6 @@ Ramjet is an independent implementation.
 ## Status
 
 Ramjet is being built reader first; the writer comes after the reader is complete.
-The aarch64 and macOS targets (darwin-x86_64 ,darwin-aarch64, linux-arm64) are built but not tested.
 
 Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what RAR 2.x through 7.x create):
 
@@ -75,21 +74,40 @@ mach build . -p release      # release: out/linux-x86_64/release/bin/ramjet
 ramjet <command> [switches] <archive> [files...] [@listfile] [dest/]
 
 commands:
-  l   list           lt  list with technical details     lb  bare names
-  t   test           x   extract with paths               e   extract without paths
-  p   print a file to stdout
+  l, v          list archive contents
+  lt, vt        list technical details
+  lta, vta      technical listing including service records
+  lb, vb        list bare file names
+  t             test archive files
+  x             extract files with full paths
+  e             extract files without paths
+  p             print file data to stdout
 
 switches:
-  -p<password>   set the password (-p asks, -p- never asks)
-  -o+ / -o- / -or   overwrite / skip / rename existing files   (-y = yes to all)
-  -x<mask>       exclude files (repeatable, -x@<file> for a list)
-  -op<path>      extract into this directory      -ad  into a folder named after the archive
-  -kb            keep files that failed their checksum
-  -ver           also extract older file versions as name;N
-  -idq / -inul   quiet / silent                    -idp  no progress display
+  -p<password>  set the password (-p alone asks for it, -p- never asks)
+  -o+           overwrite existing files
+  -o-           skip existing files
+  -or           rename extracted files when the name exists
+  -y            assume yes on all questions
+  -x<mask>      exclude files (repeatable; -x@<file> reads masks from a file)
+  -n<mask>      include files (repeatable; -n@<file> reads masks from a file)
+  -@, -@+       treat @file literally / expand it as a file list
+  -op<path>     extract into this directory
+  -ad[1,2]      choose an archive-named or archive-local destination
+  -ep           discard archived paths while extracting
+  -ep4<path>    remove an exact leading path from extracted names
+  -ai           do not restore archived file attributes
+  -c-           hide the archive comment in listings
+  -kb           keep files that failed their checksum
+  -ver[N]       extract all older versions, or only version N
+  -idc/d/n/p/q  suppress selected output details
+  -idq, -q      only show errors and the summary
+  -inul         show nothing
+  -idp          no progress percentage
+  -             stop reading switches (-- works too)
 ```
 
-Switches can go anywhere on the line (until `--`). A last argument ending in `/` is the destination; other arguments select files by name or `*`/`?` mask, and a directory name selects everything under it.
+Switches can go anywhere on the line (until `-` or `--`). A last argument ending in a path separator (`/`, or also `\` on Windows) is the destination; other arguments select files by name or `*`/`?` mask, and a directory name selects everything under it.
 
 On a terminal Ramjet asks for missing passwords (input is not echoed) and asks before overwriting files; without one it never waits for input and keeps existing files. Large files show a progress percentage.
 

@@ -1,0 +1,176 @@
+name: Test
+
+# The release workflow proves that every target cross-compiles. This workflow
+# runs the tests and the finished binary on each target's real OS and CPU.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            mach_platform: x86_64-linux
+            mach_archive: tar.gz
+            executable: ramjet
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            mach_platform: aarch64-linux
+            mach_archive: tar.gz
+            executable: ramjet
+          - target: darwin-x86_64
+            runner: macos-15-intel
+            mach_platform: x86_64-darwin
+            mach_archive: tar.gz
+            executable: ramjet
+          - target: darwin-aarch64
+            runner: macos-15
+            mach_platform: aarch64-darwin
+            mach_archive: tar.gz
+            executable: ramjet
+          - target: windows-x86_64
+            runner: windows-2025
+            mach_platform: x86_64-windows
+            mach_archive: zip
+            executable: ramjet.exe
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: fetch std tags
+        run: |
+          # The submodule is a shallow clone with no tags; mach needs them to check std's version.
+          git -C dep/std fetch --unshallow --tags --force || git -C dep/std fetch --tags --force
+          git -C dep/std tag | tail -3
+
+      - name: install mach
+        env:
+          MACH_PLATFORM: ${{ matrix.mach_platform }}
+          MACH_ARCHIVE: ${{ matrix.mach_archive }}
+        run: |
+          base=https://github.com/briar-systems/mach/releases
+          tag=$(curl -fsSI "$base/latest" | tr -d '\r' | grep -i '^location:' | sed 's|.*/tag/||')
+          ver="${tag#v}"
+          [ -n "$ver" ] || { echo "::error::could not resolve mach version"; exit 1; }
+          f="mach-$ver-$MACH_PLATFORM.$MACH_ARCHIVE"
+          dest="$RUNNER_TEMP/mach-bin"; dl="$RUNNER_TEMP/mach-dl"
+          mkdir -p "$dest" "$dl"
+          curl -fsSL -o "$dl/$f" "$base/download/v$ver/$f"
+          curl -fsSL -o "$dl/SHA256SUMS" "$base/download/v$ver/SHA256SUMS"
+          python - "$dl/SHA256SUMS" "$dl/$f" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          sums = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          archive = pathlib.Path(sys.argv[2])
+          expected = next(line.split()[0] for line in sums if line.split()[-1].lstrip("*") == archive.name)
+          actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"checksum mismatch for {archive.name}: {actual} != {expected}")
+          PY
+          case "$MACH_ARCHIVE" in
+            zip) python -m zipfile -e "$dl/$f" "$dest" ;;
+            tar.gz) tar -xzf "$dl/$f" -C "$dest" ;;
+          esac
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mach info
+          mach test . -t "$TARGET"
+
+      - name: build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          mach build . -t "$TARGET" -p release
+          binary="out/$TARGET/release/bin/$EXECUTABLE"
+          [ -f "$binary" ] || { echo "::error::missing $binary"; exit 1; }
+          "$binary" --version
+
+      - name: list, test and extract real archives
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          binary="$PWD/out/$TARGET/release/bin/$EXECUTABLE"
+          fixtures="$RUNNER_TEMP/ramjet-fixtures"
+          mkdir -p "$fixtures/stored" "$fixtures/compressed"
+
+          # Small RAR 5 archives from libarchive's public test suite, pinned to
+          # a commit so the inputs and their expected hashes cannot drift.
+          base=https://raw.githubusercontent.com/libarchive/libarchive/b85b1ad628c50ab7ef8a276b8aeaceb0db55b3b2/libarchive/test
+          curl -fsSL -o "$fixtures/stored.rar.uu" "$base/test_read_format_rar5_stored.rar.uu"
+          curl -fsSL -o "$fixtures/compressed.rar.uu" "$base/test_read_format_rar5_compressed.rar.uu"
+
+          python - "$fixtures" <<'PY'
+          import binascii
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          expected = {
+              "stored.rar": "35d75e315d164d2e329afc28f7d844f013271b4fcffd4ddd78efcdd114a383a7",
+              "compressed.rar": "68f9d7e2662cd5bc5607ba9c6bf1edbf121cf3b08011a7d8643091791750a7c8",
+          }
+          for source in root.glob("*.uu"):
+              lines = source.read_bytes().splitlines()
+              start = next(i for i, line in enumerate(lines) if line.startswith(b"begin ")) + 1
+              decoded = bytearray()
+              for line in lines[start:]:
+                  if line == b"end":
+                      break
+                  if line not in (b"", b"`"):
+                      decoded.extend(binascii.a2b_uu(line))
+              destination = source.with_suffix("")
+              destination.write_bytes(decoded)
+              actual = hashlib.sha256(decoded).hexdigest()
+              if actual != expected[destination.name]:
+                  raise SystemExit(f"checksum mismatch for {destination.name}: {actual}")
+          PY
+
+          "$binary" l "$fixtures/stored.rar"
+          "$binary" t "$fixtures/stored.rar"
+          "$binary" t "$fixtures/compressed.rar"
+          "$binary" x -o+ "$fixtures/stored.rar" "$fixtures/stored/"
+          "$binary" x -o+ "$fixtures/compressed.rar" "$fixtures/compressed/"
+
+          python - "$fixtures" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          if (root / "stored" / "helloworld.txt").read_bytes() != b"hello libarchive test suite!\n":
+              raise SystemExit("stored archive extracted the wrong contents")
+          actual = hashlib.sha256((root / "compressed" / "test.bin").read_bytes()).hexdigest()
+          expected = "588870a2dade35c2650fbb7898c9a9c7f21fce7c281198604e8d0c9737f2c375"
+          if actual != expected:
+              raise SystemExit(f"compressed archive extracted the wrong contents: {actual}")
+          PY

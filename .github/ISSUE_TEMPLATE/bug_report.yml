@@ -1,0 +1,57 @@
+name: Bug report
+description: Report incorrect output, a crash, corruption or an incompatible archive
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Ramjet problem. Please provide enough detail to reproduce it without sharing private data or proprietary software.
+
+  - type: input
+    id: version
+    attributes:
+      label: Ramjet version
+      description: Output of `ramjet --version`, or the commit used.
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+    validations:
+      required: true
+
+  - type: textarea
+    id: archive
+    attributes:
+      label: Archive details
+      description: Include the RAR archive version, creating program, compression method, and whether it is solid, encrypted or multi-volume when known.
+      placeholder: RAR 5 archive created by ..., method -m5, solid, not encrypted
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and reproduction steps
+      description: Show the exact Ramjet command and the smallest sequence that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour and output
+      description: Include the exit status and complete error output where possible.
+    validations:
+      required: true
+

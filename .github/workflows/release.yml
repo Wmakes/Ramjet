@@ -22,6 +22,11 @@ on:
         required: true
         type: boolean
         default: false
+      allow_version_mismatch:
+        description: "Allow version to differ from mach.toml (warning only)"
+        required: true
+        type: boolean
+        default: false
       mach_version:
         description: "Mach compiler version, e.g. 6.10.1 (empty = latest)"
         required: false
@@ -56,6 +61,24 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]] || { echo "::error::bad version '$VERSION' (want e.g. 0.3.7)"; exit 1; }
+
+      - name: verify manifest version
+        env:
+          VERSION: ${{ inputs.version }}
+          ALLOW_MISMATCH: ${{ inputs.allow_version_mismatch }}
+        run: |
+          manifest_version=$(awk -F'"' '/^version = "/ { print $2; exit }' mach.toml)
+          if [ "$manifest_version" != "$VERSION" ]; then
+            message="Release version $VERSION does not match mach.toml version ${manifest_version:-missing}"
+            if [ "$ALLOW_MISMATCH" = "true" ]; then
+              echo "::warning file=mach.toml::$message; continuing because allow_version_mismatch is enabled"
+            else
+              echo "::error file=mach.toml::$message"
+              exit 1
+            fi
+          else
+            echo "mach.toml version matches release version $VERSION"
+          fi
 
       - name: set version in mach.toml
         env:
