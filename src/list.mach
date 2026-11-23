@@ -126,7 +126,8 @@ fun ratio(unp: u64, packed: u64) u64 {
 
 fun print_header(ar: *AR.Archive, archive: *u8, show_comment: bool) {
     print.printf("Archive: {}\n", archive::str);
-    if (ar.rar4)              { print.print("Details: RAR 4"); }
+    if (ar.rar13)             { print.print("Details: RAR 1.3"); }
+    or (ar.rar4)              { print.print("Details: RAR 4"); }
     or                        { print.print("Details: RAR 5"); }
     if (ar.volume)            { print.printf(", volume {}", ar.first_volume_number + 1); }
     if (ar.solid)             { print.print(", solid"); }
@@ -235,7 +236,8 @@ pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool, all_hea
             if (e.h.crypt.present) { flag = '*'; }
             print.printf("{:c}{}  {:10} {:10} {:4}% ", flag, (?attr[0])::str, e.h.unp_size, packed, ratio(e.h.unp_size, packed));
             print_date(e.h.mtime);
-            print.printf(" {:08X} {}", e.h.data_crc, e.name::str);
+            if (ar.rar13)      { print.printf("     {:04X} {}", e.h.data_crc, e.name::str); }
+            or                 { print.printf(" {:08X} {}", e.h.data_crc, e.name::str); }
             if (e.link != nil) { print.printf(" -> {}", e.link::str); }
             if (!e.complete)   { print.print("  [incomplete]"); }
             print.println("");
@@ -278,8 +280,14 @@ pub fun list(ar: *AR.Archive, archive: *u8, technical: bool, bare: bool, all_hea
             if (e.h.solid) { print.print(" solid"); }
             print.println("");
             if (e.h.crypt.present) {
-                print.printf("  Encryption: AES-256, KDF 2^{}", e.h.crypt.kdf_count);
-                if ((e.h.crypt.flags & H.CRYPT_HASHMAC) != 0) { print.print(", tweaked checksums"); }
+                if (e.h.crypt.rar4 && e.h.crypt.version == 13) { print.print("  Encryption: RAR 1.3"); }
+                or (e.h.crypt.rar4 && e.h.crypt.version == 15) { print.print("  Encryption: RAR 1.5"); }
+                or (e.h.crypt.rar4 && e.h.crypt.version < 29)  { print.print("  Encryption: RAR 2.0"); }
+                or (e.h.crypt.rar4)                            { print.print("  Encryption: AES-128"); }
+                or {
+                    print.printf("  Encryption: AES-256, KDF 2^{}", e.h.crypt.kdf_count);
+                    if ((e.h.crypt.flags & H.CRYPT_HASHMAC) != 0) { print.print(", tweaked checksums"); }
+                }
                 print.println("");
             }
             if (e.h.has_uid || e.h.user_name != nil) {

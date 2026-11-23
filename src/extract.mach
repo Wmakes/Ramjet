@@ -69,6 +69,7 @@ pub val QUIET_ALL:   u8 = 2;
 # restore_attrs: restore permission bits and Windows attributes
 # show_names:    show one report line per processed entry
 # summary:       show the final success or error count
+# max_dict:      largest RAR 5/7 dictionary allocation permitted
 pub rec Options {
     mode:          u8;
     dest:          *u8;
@@ -88,6 +89,7 @@ pub rec Options {
     restore_attrs: bool;
     show_names:    bool;
     summary:       bool;
+    max_dict:      u64;
 }
 
 # options for internal decoding with no output and no questions
@@ -111,6 +113,7 @@ pub fun silent_options() Options {
     o.restore_attrs = true;
     o.show_names    = false;
     o.summary       = false;
+    o.max_dict      = U.DEFAULT_MAX_DICT;
     ret o;
 }
 
@@ -205,7 +208,7 @@ fun selected(st: *State, e: *AR.Entry) bool {
 
 # does this byte separate path components on the system we extract on
 fun is_separator(c: u8) bool {
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         ret c == '/' || c == '\\';
     }
     $or {
@@ -303,7 +306,7 @@ fun safe_name(e: *AR.Entry, flat: bool, strip_prefix: *u8, strip_version: bool) 
             ret nil;
         }
         var end: usize = j;
-        $if ($mach.build.os == $mach.os.windows) {
+        $if ($mach.build.sys == $mach.sys.windows) {
             for (end > i && (src[end - 1] == '.' || src[end - 1] == ' ')) { end = end - 1; }
             # only dots and spaces: Windows would resolve it to "." or ".."
             if (end == i && j > i && !(j - i == 1 && src[i] == '.')) {
@@ -318,7 +321,7 @@ fun safe_name(e: *AR.Entry, flat: bool, strip_prefix: *u8, strip_version: bool) 
                 out[o] = '/';
                 o      = o + 1;
             }
-            $if ($mach.build.os == $mach.os.windows) {
+            $if ($mach.build.sys == $mach.sys.windows) {
                 if (reserved_device(?src[i], len)) {
                     out[o] = '_';
                     o      = o + 1;
@@ -329,7 +332,7 @@ fun safe_name(e: *AR.Entry, flat: bool, strip_prefix: *u8, strip_version: bool) 
                 var c: u8 = src[k];
                 # a backslash in a Windows name is not a valid character
                 if (e.h.host_os == H.HOST_WINDOWS && c == '\\') { c = '_'; }
-                $if ($mach.build.os == $mach.os.windows) {
+                $if ($mach.build.sys == $mach.sys.windows) {
                     if (c < 0x20 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') { c = '_'; }
                     if (k >= end)                                                                                     { c = '_'; }
                 }
@@ -387,9 +390,10 @@ fun path_exists(path: *u8) bool {
 
 # ---------------------------------------------------------------- keys
 
-# the pre-AES cipher an entry uses: 15, 20, or 0 for AES
+# the pre-AES cipher an entry uses: 13, 15, 20, or 0 for AES
 fun old_cipher(e: *AR.Entry) u32 {
-    if (e.h.unp_ver == 15) { ret 15; }
+    if (e.h.crypt.version == 13) { ret 13; }
+    if (e.h.unp_ver == 15)       { ret 15; }
     # RAR 2.x; a salt means the AES of RAR 2.9 and later
     if ((e.h.unp_ver == 20 || e.h.unp_ver == 26) && !e.h.crypt.salted) { ret 20; }
     ret 0;
@@ -444,6 +448,7 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
 
     var p: S.Packed;
     S.packed_open(?p, ar, e);
+    if (ar.rar13) { S.sink_checksum13(sink); }
     S.sink_pipeline(sink, e.h.unp_size);
     if (e.h.crypt.present && e.h.crypt.rar4 && old_cipher(e) != 0) {
         if (ar.password == nil) { ret E.NEED_PASSWORD; }
@@ -483,14 +488,16 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
             if (!(known && e.h.unp_size == 0 && AR.packed_size(ar, e) == 0)) {
                 if (e.h.unp_ver == 29 || e.h.unp_ver == 36) { rc = U4.run(?st.unp4, ?p, sink, e.h.unp_size, known, e.h.solid); }
                 or (e.h.unp_ver == 20 || e.h.unp_ver == 26) { rc = U20.run(?st.unp20, ?p, sink, e.h.unp_size, known, e.h.solid); }
-                or (e.h.unp_ver == 15)                      { rc = U15.run(?st.unp15, ?p, sink, e.h.unp_size, known, e.h.solid); }
+                or (e.h.unp_ver == 13 || e.h.unp_ver == 15) { rc = U15.run(?st.unp15, ?p, sink, e.h.unp_size, known, e.h.solid); }
                 or                                          { ret E.UNSUPPORTED; }
             }
         }
-        or (e.h.comp_version != 0 && !e.h.v1_as_v0) { ret E.UNSUPPORTED; }
+        or (e.h.comp_version > 1) { ret E.UNSUPPORTED; }
         # an empty file has no blocks at all, even in a solid stream
         or (!(known && e.h.unp_size == 0 && AR.packed_size(ar, e) == 0)) {
-            rc = U.begin(?st.unp, e.h.dict_size, e.h.solid);
+            var comp_version: u64 = e.h.comp_version;
+            if (e.h.v1_as_v0) { comp_version = 0; }
+            rc = U.begin(?st.unp, e.h.dict_size, e.h.solid, comp_version, st.opt.max_dict);
             if (rc == E.OK) { rc = U.run(?st.unp, ?p, sink, e.h.unp_size, known); }
         }
     }
@@ -502,7 +509,13 @@ fun unpack_entry(st: *State, e: *AR.Entry, sink: *S.Sink) E.Code {
 
     val tweak: bool        = e.h.crypt.present && !e.h.crypt.rar4 && (e.h.crypt.flags & H.CRYPT_HASHMAC) != 0;
     val last:  *AR.Segment = AR.segment(ar, e.seg_last);
-    if (last.has_crc) {
+    if (ar.rar13) {
+        if (S.sink_sum16(sink)::u32 != e.h.data_crc) {
+            if (e.h.crypt.present) { ret E.BAD_PASSWORD; }
+            ret E.DATA_CRC;
+        }
+    }
+    or (last.has_crc) {
         var crc: u32 = S.sink_crc(sink);
         if (tweak) { crc = C.tweak_crc(?st.keys, crc); }
         if (crc != last.crc) {
@@ -984,7 +997,18 @@ pub fun load_comment(ar: *AR.Archive) {
             # comments never continue a solid stream
             val solid: bool = e.h.solid;
             e.h.solid = false;
-            val rc: E.Code = unpack_entry(?st, e, ?sink);
+            var rc: E.Code = E.OK;
+            if (ar.rar13) {
+                var p: S.Packed;
+                S.packed_open(?p, ar, e);
+                S.packed_encrypt13_comment(?p);
+                rc = U15.run(?st.unp15, ?p, ?sink, e.h.unp_size, true, false);
+                S.packed_drain(?p);
+                S.sink_finish(?sink);
+            }
+            or {
+                rc = unpack_entry(?st, e, ?sink);
+            }
             e.h.solid = solid;
             U.dnit(?st.unp);
             U4.dnit(?st.unp4);

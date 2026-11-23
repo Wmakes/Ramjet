@@ -45,7 +45,7 @@ pub fun dnit(b: *BitIn) {
 
 # keep at least 8 readable bytes ahead of the read position; past the end
 # of the data the buffer holds zeros
-#[inline]
+#[inline("always")]
 fun ensure(b: *BitIn) {
     var byte: usize = (b.bitpos >> 3)::usize;
     if (byte + 8 <= b.len) { ret; }
@@ -76,7 +76,7 @@ fun ensure(b: *BitIn) {
 }
 
 # the next 16 bits, left aligned in the low 16 bits of the result
-#[inline]
+#[inline("always")]
 pub fun peek16(b: *BitIn) u32 {
     ensure(b);
     val p: *u8 = ?b.buf[(b.bitpos >> 3)::usize];
@@ -84,13 +84,13 @@ pub fun peek16(b: *BitIn) u32 {
     ret (v >> (8 - (b.bitpos & 7))::u32) & 0xFFFF;
 }
 
-#[inline]
+#[inline("always")]
 pub fun skip(b: *BitIn, n: u32) {
     b.bitpos = b.bitpos + n::u64;
 }
 
 # n bits (1-16)
-#[inline]
+#[inline("always")]
 pub fun bits(b: *BitIn, n: u32) u32 {
     val v: u32 = peek16(b) >> (16 - n);
     skip(b, n);
@@ -103,7 +103,7 @@ pub fun align(b: *BitIn) {
 }
 
 # one whole byte at a byte boundary (for the range decoder)
-#[inline]
+#[inline("always")]
 pub fun byte(b: *BitIn) u8 {
     ensure(b);
     val v: u8 = b.buf[(b.bitpos >> 3)::usize];

@@ -1,14 +1,18 @@
 # Provenance notes
 
-Where every piece of format knowledge in Ramjet came from. The rule: nothing
-is taken from RAR, WinRAR or UnRAR source or binaries (no decompiling, no
-disassembly), and nothing is copied or translated from other implementations.
+Where Ramjet's format knowledge came from. The RAR reader is independently
+implemented: nothing is taken from RAR, WinRAR or UnRAR source or binaries
+(no decompiling or disassembly), and no RAR code is copied or translated from
+other implementations. The portable SHA-256 implementation is adapted from
+mach-crypto as recorded below; it is not RAR format code.
 
 ## Sources allowed
 
 | Source | License | How it is used |
 |---|---|---|
+| [briar-systems/mach-crypto `src/hash/sha256.mach`](https://github.com/briar-systems/mach-crypto/blob/e7f9c303519c3d1fa6013b21f5a9247604dd2c88/src/hash/sha256.mach) | MIT, (c) Briar Systems LLC | portable SHA-256 compression implementation adapted in `src/crypto/sha256.mach`; license notice is included in that file and `THIRD_PARTY_NOTICES.txt`; no dependency is added |
 | [RARLAB RAR 5.0 technote](https://www.rarlab.com/technote.htm) (linked, not copied into the repo) | no license stated; read for interoperability | the RAR5 container: signature, every header and extra record |
+| [RARLAB UnRAR 7 algorithm notes](https://www.rarlab.com/unrar7notes.htm) (linked, not copied into the repo) | no license stated; read for interoperability | RAR 7's 80 distance codes, non-power-of-two window arithmetic and explicit large-dictionary memory limit |
 | `technote.txt` from a user-supplied RAR 4.20 package (**not** in the repo; no script downloads it) | RAR EULA | the RAR 1.5-4.x container: block layout, main and file headers |
 | `rar` 7.23 and `rar` 4.20 (trial), run as ordinary programs | RAR EULA | create the sample archives in `tests/samples` and `tests/samples/rar4` on the developer's machine (generated, not committed); `rar lt` output is the expected listing |
 | libarchive `archive_read_support_format_rar5.c` and `archive_read_support_format_rar.c` | BSD-2-Clause, (c) Grzegorz Antoniak, Tim Kientzle, Andres Mejia | **read only**, to understand the compressed bitstreams and the standard VM filters; no code copied or translated |
@@ -20,6 +24,7 @@ disassembly), and nothing is copied or translated from other implementations.
 | FIPS-180-4, FIPS-197, RFC 2104, RFC 4231, RFC 7693, RFC 8018, RFC 8536 | public standards | SHA-1, AES-128/256, HMAC-SHA256, BLAKE2s, PBKDF2, TZif |
 | BLAKE2 paper / blake2.net | public; reference code CC0 | BLAKE2sp tree parameters |
 | Intel IA-64 instruction format | public ISA documentation | the Itanium branch filter |
+| [bitplane/rar-research](https://github.com/bitplane/rar-research) documentation and external fixture corpus, commit `c8a280d28a466e13d05812a2415ab0359950c823` | no repository license stated; read/run externally for interoperability, nothing copied into this repository | public clean-room descriptions and black-box fixtures for RAR 1.3/1.5 framing, checksums, encryption, comments, SFX and historical edge cases |
 
 Never used: UnRAR source (its license forbids re-creating the compressor
 from it), 7-Zip's RAR code (derived from UnRAR).
@@ -102,26 +107,37 @@ checking Ramjet's results against archives `rar` made (`tests/samples`):
   like a file; the main header's CRC then covers only its own fields, not
   the comment (`comment`).
 
+## RAR 1.3 and 1.5: confirmed against public historical fixtures
+
+- **RAR 1.3 container and cipher**: the `RE~^` main/file headers, rolling
+  16-bit file checksum, three-byte stream cipher, old-style volumes, solid
+  state, directory entries, SFX guard and packed archive comments pass the
+  RAR 1.402 fixture matrix from `bitplane/rar-research`.
+- **RAR 1.5 decoder and cipher** (`src/rar4/unpack15.mach`): verified against
+  real WinRAR 1.54 archives containing normal/best compression, audio-shaped
+  data, solid data, encryption, SFX and a three-volume 2 MB stream.
+
+## RAR 7: confirmed black-box against `rar` 7.23 output
+
+- **Compression algorithm version 1** (`src/rar5/unpack.mach`): a 4.2 GB
+  sparse input archived with a 4.25 GB non-power-of-two dictionary exercises
+  the 80-code distance table and modulo window; Ramjet decodes it and verifies
+  its CRC. Dictionaries over 4 GB require an explicit `-md` limit so an
+  untrusted header cannot trigger an unexpected huge allocation.
+- **ARM filter** (type 3): verified against libarchive's public
+  `test_read_format_rar5_arm.rar` fixture.
+
 ## Implemented from the format description but not confirmed
 
-- **RAR 1.5 decoder and cipher** (`src/rar4/unpack15.mach`): no RAR 1.5x
-  binary is available any more to make samples. The fixed code tables are
-  checked to be complete prefix codes, and fuzzing (RAR 2.0 data relabeled
-  as version 15) shows it rejects bad data without crashing, but it has
-  never decoded a real RAR 1.5 file.
 - **RAR 2.6 encryption** (unpack version 26): treated as the RAR 2.0 cipher
   when no salt is present; no sample exists.
-- **RAR 1.3 cipher and the pre-1.5 `RE~^` container**: not supported.
-
-- **RAR 5 ARM filter** (type 3): `rar` 7.23 never emitted it, even for real
-  ARMv7 binaries, so no sample exercises it.
-- **RAR 5 compression algorithm version 1** (RAR 7 dictionaries over 4 GB):
-  not decoded; such files report "unsupported feature". `-md1g` still
-  produces version 0 data.
 - **Windows-only metadata** (NTFS ACL and stream service headers): parsed
   and skipped.
 
 ## Audit (2026-10-09, before the first public release)
+
+This audit predates the SHA-256 adaptation listed above; it covers the RAR
+reader and its format references only.
 
 A token comparison checked all 29 source files against every
 reference file that was read (libarchive's RAR readers and PPMd code, the
@@ -136,7 +152,8 @@ more comment words:
 - constant tables that the formats fix: the RAR 2.0 cipher's substitution
   table and PPMd's escape table
 
-The repository distributes only Ramjet's own sources, scripts and
-documentation; no RAR binaries, RAR documentation or sample archives made by
-RAR are committed. Ramjet's binaries include mach-std (MIT); see
-`THIRD_PARTY_NOTICES.txt`.
+The repository distributes Ramjet's sources, scripts and documentation; no
+RAR binaries, RAR documentation or sample archives made by RAR are committed.
+Ramjet's binaries include mach-std and the adapted mach-crypto SHA-256 code,
+both under MIT terms; see `THIRD_PARTY_NOTICES.txt` and the source notice in
+`src/crypto/sha256.mach`.

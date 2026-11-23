@@ -3,7 +3,7 @@
 # PBKDF2 here exposes its running block so a caller can keep iterating past
 # the nominal count, which is how RAR5 derives its extra values.
 
-use sha: std.crypto.hash.sha256;
+use sha: ramjet.crypto.sha256;
 use std.types.size.usize;
 
 # HMAC keyed state: SHA-256 after absorbing the inner and outer key pads

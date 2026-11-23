@@ -387,6 +387,13 @@ pub fun parse_file(p: *u8, b: *Block, out: *H.FileHeader) bool {
     out.subdata      = nil;
     out.subdata_len  = 0;
 
+    # RAR 2.x can append an old 0x75 comment block inside HEAD_SIZE. The
+    # file header checksum stops after the ordinary file fields and does not
+    # cover that attached comment, just like the main-header form.
+    if (!b.crc_ok && (b.flags & LHD_COMMENT) != 0 && c.pos >= 2) {
+        b.crc_ok = (crc32.hash(?p[2], c.pos - 2) & 0xFFFF)::u16 == b.crc;
+    }
+
     # an older version (-ver) carries ";n" at the end of its name
     if ((b.flags & LHD_VERSION) != 0) {
         var k:   usize = out.name_len;

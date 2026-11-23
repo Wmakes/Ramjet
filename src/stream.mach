@@ -33,10 +33,13 @@ pub rec Packed {
     part_crc: u32;
     part_b2:  b2.Blake2sp;
     part_bad: bool;
+    # RAR 1.5 split files use 0xffffffff placeholders before the final part.
+    check_part_hashes: bool;
 
     encrypted: bool;
-    # RAR 1.5 / 2.0 ciphers instead of AES (old = 15 or 20)
+    # RAR 1.3 / 1.5 / 2.0 ciphers instead of AES (old = 13, 15 or 20)
     old:       u32;
+    c13:       OC.Rar13;
     c15:       OC.Rar15;
     c20:       OC.Rar20;
     key:       aes.Key;
@@ -53,11 +56,12 @@ pub fun packed_open(p: *Packed, ar: *AR.Archive, e: *AR.Entry) {
     p.left     = AR.segment(ar, e.seg_first).size;
     p.part_crc = crc32.init();
     b2.sp_init(?p.part_b2);
-    p.part_bad  = false;
-    p.encrypted = false;
-    p.old       = 0;
-    p.block_pos = 0;
-    p.block_len = 0;
+    p.part_bad          = false;
+    p.check_part_hashes = !(e.h.rar4 && e.h.unp_ver == 15);
+    p.encrypted         = false;
+    p.old               = 0;
+    p.block_pos         = 0;
+    p.block_len         = 0;
 }
 
 pub fun packed_encrypt(p: *Packed, key: *u8, iv: *u8) {
@@ -66,12 +70,19 @@ pub fun packed_encrypt(p: *Packed, key: *u8, iv: *u8) {
     M.copy(?p.iv[0], iv, 16);
 }
 
-# data of RAR 1.5 (version 15) or RAR 2.0 (version 20) archives
+# data of RAR 1.3 (13), RAR 1.5 (15) or RAR 2.0 (20) archives
 pub fun packed_encrypt_old(p: *Packed, version: u32, pw: *u8, n: usize) {
     p.encrypted = true;
     p.old       = version;
-    if (version == 15) { OC.rar15_init(?p.c15, pw, n); }
+    if (version == 13) { OC.rar13_init(?p.c13, pw, n); }
+    or (version == 15) { OC.rar15_init(?p.c15, pw, n); }
     or                 { OC.rar20_init(?p.c20, pw, n); }
+}
+
+pub fun packed_encrypt13_comment(p: *Packed) {
+    p.encrypted = true;
+    p.old       = 13;
+    OC.rar13_comment_init(?p.c13);
 }
 
 # AES-128 data of RAR 2.9-4.x archives
@@ -89,8 +100,8 @@ fun raw_read(p: *Packed, dst: *u8, n: usize) usize {
         val s: *AR.Segment = AR.segment(p.ar, p.seg::usize);
         if (p.left == 0) {
             # finished this part: verify its packed CRC unless it is the last
-            if (s.next >= 0 && s.has_crc && crc32.final(p.part_crc) != s.crc) { p.part_bad = true; }
-            if (s.next >= 0 && s.has_blake2) {
+            if (p.check_part_hashes && s.next >= 0 && s.has_crc && crc32.final(p.part_crc) != s.crc) { p.part_bad = true; }
+            if (p.check_part_hashes && s.next >= 0 && s.has_blake2) {
                 var d: [32]u8;
                 b2.sp_final(?p.part_b2, ?d[0]);
                 var k: usize = 0;
@@ -130,6 +141,15 @@ fun raw_read(p: *Packed, dst: *u8, n: usize) usize {
 # read up to n bytes of (decrypted) packed data; fewer means the data ended
 pub fun packed_read(p: *Packed, dst: *u8, n: usize) usize {
     if (!p.encrypted) { ret raw_read(p, dst, n); }
+    if (p.old == 13) {
+        val got: usize = raw_read(p, dst, n);
+        var i:   usize = 0;
+        for (i < got) {
+            dst[i] = OC.rar13_byte(?p.c13, dst[i]);
+            i      = i + 1;
+        }
+        ret got;
+    }
     if (p.old == 15) {
         val got: usize = raw_read(p, dst, n);
         var i:   usize = 0;
@@ -170,6 +190,8 @@ pub rec Sink {
     mode:       u8;
     fd:         usize;
     crc:        u32;
+    sum16:      u16;
+    use_sum16:  bool;
     use_blake2: bool;
     blake2:     b2.Blake2sp;
     written:    u64;
@@ -196,6 +218,8 @@ pub fun sink_init(s: *Sink, mode: u8, fd: usize, blake2: bool) {
     s.mode       = mode;
     s.fd         = fd;
     s.crc        = crc32.init();
+    s.sum16      = 0;
+    s.use_sum16  = false;
     s.use_blake2 = blake2;
     if (blake2) { b2.sp_init(?s.blake2); }
     s.written    = 0;
@@ -241,6 +265,14 @@ pub fun sink_memory(s: *Sink, buf: *u8, cap: usize) {
 # hash and store n bytes; runs on the worker thread for piped sinks
 fun consume(s: *Sink, p: *u8, n: usize) {
     s.crc = crc32.update(s.crc, p, n);
+    if (s.use_sum16) {
+        var i: usize = 0;
+        for (i < n) {
+            s.sum16 = s.sum16 + p[i]::u16;
+            s.sum16 = (s.sum16 << 1) | (s.sum16 >> 15);
+            i       = i + 1;
+        }
+    }
     if (s.use_blake2) { b2.sp_update(?s.blake2, p, n); }
     if (s.mode == SINK_FD && !s.failed) {
         var off: usize = 0;
@@ -259,6 +291,14 @@ pub fun sink_write(s: *Sink, p: *u8, n: usize) {
     if (n == 0) { ret; }
     if (s.mode == SINK_MEMORY) {
         s.crc = crc32.update(s.crc, p, n);
+        if (s.use_sum16) {
+            var i: usize = 0;
+            for (i < n) {
+                s.sum16 = s.sum16 + p[i]::u16;
+                s.sum16 = (s.sum16 << 1) | (s.sum16 >> 15);
+                i       = i + 1;
+            }
+        }
         if (s.written + n::u64 > s.mem_cap::u64) {
             s.failed = true;
         }
@@ -341,8 +381,8 @@ fun pipe_start() bool {
         pipe.chunks[i].stop = false;
         i                   = i + 1;
     }
-    sem.init(?pipe.full, 0, CHUNKS::i64);
-    sem.init(?pipe.empty, CHUNKS::i64, CHUNKS::i64);
+    sem.make(?pipe.full, 0, CHUNKS::i64);
+    sem.make(?pipe.empty, CHUNKS::i64, CHUNKS::i64);
     pipe.head = 0;
     pipe.tail = 0;
     val r: thread.Operation = thread.spawn_with(worker, nil, ?pipe.worker);
@@ -366,6 +406,11 @@ pub fun sink_pipeline(s: *Sink, expected: u64) {
     if (s.mode == SINK_MEMORY || expected < CHUNK::u64) { ret; }
     if (!pipe_start())                                  { ret; }
     s.piped = true;
+}
+
+pub fun sink_checksum13(s: *Sink) {
+    s.use_sum16 = true;
+    s.sum16     = 0;
 }
 
 # wait until the worker has hashed and written everything; required before
@@ -400,6 +445,10 @@ pub fun shutdown() {
 
 pub fun sink_crc(s: *Sink) u32 {
     ret crc32.final(s.crc);
+}
+
+pub fun sink_sum16(s: *Sink) u16 {
+    ret s.sum16;
 }
 
 pub fun sink_blake2(s: *Sink, out: *u8) {

@@ -1,4 +1,4 @@
-# RAR 5.0 decompression (compression algorithm version 0)
+# RAR 5.0 and 7.0 decompression (compression algorithm versions 0 and 1)
 #
 # the packed data of a file is a sequence of blocks:
 #
@@ -13,8 +13,8 @@
 # the value 15, anything else n means n+2 zero lengths) for the table that
 # then codes the 430 lengths of the main tables:
 #
-#   306 literal/length symbols, 64 distance slots, 16 low distance bits,
-#   44 repeat lengths
+#   306 literal/length symbols, 64 (version 0) or 80 (version 1) distance
+#   slots, 16 low distance bits, 44 repeat lengths
 #
 # with symbols 16/17 repeating the previous length (3 bits + 3, 7 bits + 11)
 # and 18/19 emitting zeros (3 bits + 3, 7 bits + 11). each table is a
@@ -36,19 +36,22 @@ use HF: ramjet.huffman;
 use M:  ramjet.mem;
 use S:  ramjet.stream;
 
-val NC:     usize = 306;
-val DC:     usize = 64;
-val LDC:    usize = 16;
-val RC:     usize = 44;
-val BC:     usize = 20;
-val TABLES: usize = 430;
+val NC:      usize = 306;
+val DCB:     usize = 64;
+val DCX:     usize = 80;
+val LDC:     usize = 16;
+val RC:      usize = 44;
+val BC:      usize = 20;
+val TABLESB: usize = 430;
+val TABLESX: usize = 446;
 
 # the longest match: length code 43 with 9 extra bits, plus 3 for distance
-val     MAX_MATCH:   u64   = 0x1104;
-val     MIN_WINDOW:  u64   = 0x800000;
-val     MAX_FILTER:  u64   = 0x400000;
-val     MAX_FILTERS: usize = 8192;
-pub val MAX_DICT:    u64   = 0x100000000;
+val     MAX_MATCH:        u64   = 0x1104;
+val     MIN_WINDOW:       u64   = 0x800000;
+val     MAX_FILTER:       u64   = 0x400000;
+val     MAX_FILTERS:      usize = 8192;
+pub val DEFAULT_MAX_DICT: u64   = 0x100000000;
+pub val MAX_DICT:         u64   = 0x10000000000;
 
 val FILTER_DELTA: u8 = 0;
 val FILTER_E8:    u8 = 1;
@@ -67,6 +70,9 @@ pub rec Unpacker {
     window: *u8;
     wsize:  u64;
     wmask:  u64;
+    dict:   u64;
+    dc:     usize;
+    exact:  bool;
 
     # absolute output positions: decoded so far, handed to the sink so far,
     # and where the current file started
@@ -106,6 +112,9 @@ pub fun init(u: *Unpacker) {
     u.window      = nil;
     u.wsize       = 0;
     u.wmask       = 0;
+    u.dict        = 0;
+    u.dc          = DCB;
+    u.exact       = false;
     u.pos         = 0;
     u.flushed     = 0;
     u.file_start  = 0;
@@ -143,10 +152,14 @@ pub fun dnit(u: *Unpacker) {
 # ---
 # dict:  dictionary size the file needs
 # solid: continue the previous file's window and tables
-pub fun begin(u: *Unpacker, dict: u64, solid: bool) E.Code {
-    if (dict > MAX_DICT) { ret E.DICT_TOO_LARGE; }
+pub fun begin(u: *Unpacker, dict: u64, solid: bool, version: u64, max_dict: u64) E.Code {
+    if (version > 1)                                     { ret E.UNSUPPORTED; }
+    if (dict == 0 || dict > MAX_DICT || dict > max_dict) { ret E.DICT_TOO_LARGE; }
     var want: u64 = MIN_WINDOW;
-    for (want < dict) { want = want << 1; }
+    if (version == 1 && dict > want) { want = dict; }
+    or {
+        for (want < dict) { want = want << 1; }
+    }
 
     if (solid && (u.broken || u.window == nil || want > u.wsize)) {
         # a solid file cannot start without the window the previous file left
@@ -169,6 +182,10 @@ pub fun begin(u: *Unpacker, dict: u64, solid: bool) E.Code {
         reset_state(u);
         u.broken = false;
     }
+    u.dict  = dict;
+    u.dc    = DCB;
+    u.exact = version == 1;
+    if (u.exact) { u.dc = DCX; }
     if (u.filters == nil) {
         u.filters = M.alloc(MAX_FILTERS * $size_of(Filter))::*Filter;
         if (u.filters == nil) { ret E.NO_MEMORY; }
@@ -182,7 +199,7 @@ pub fun begin(u: *Unpacker, dict: u64, solid: bool) E.Code {
 
 # the next 32 bits of the block at the read position, MSB first; the block
 # buffer carries 8 zero bytes past its end so this never reads outside it
-#[inline]
+#[inline("always")]
 fun peek32(u: *Unpacker) u32 {
     val byte: usize = (u.bitpos >> 3)::usize;
     val p:    *u8   = ?u.blk[byte];
@@ -190,22 +207,28 @@ fun peek32(u: *Unpacker) u32 {
     ret ((v << (u.bitpos & 7)) >> 8)::u32;
 }
 
-#[inline]
+#[inline("always")]
 fun peek16(u: *Unpacker) u32 {
     ret peek32(u) >> 16;
 }
 
-#[inline]
+#[inline("always")]
 fun skip_bits(u: *Unpacker, n: u32) {
     u.bitpos = u.bitpos + n::u64;
 }
 
-#[inline]
+#[inline("always")]
 fun get_bits(u: *Unpacker, n: u32) u32 {
     if (n == 0) { ret 0; }
     val v: u32 = peek32(u) >> (32 - n);
     skip_bits(u, n);
     ret v;
+}
+
+fun get_bits64(u: *Unpacker, n: u32) u64 {
+    if (n <= 32) { ret get_bits(u, n)::u64; }
+    val high: u64 = get_bits(u, n - 32)::u64;
+    ret (high << 32) | get_bits(u, 32)::u64;
 }
 
 fun past_end(u: *Unpacker) bool {
@@ -219,7 +242,7 @@ fun build(h: *HF.Huff, lengths: *u8, n: usize) bool {
 }
 
 # decode one symbol; returns 0xFFFF for a code that matches nothing
-#[inline]
+#[inline("always")]
 fun decode(u: *Unpacker, h: *HF.Huff) u32 {
     val r: u32 = HF.lookup(h, peek16(u));
     skip_bits(u, r >> 16);
@@ -238,8 +261,9 @@ fun read_tables(u: *Unpacker) bool {
                 i     = i + 1;
             }
             or {
+                if (z::usize + 2 > BC - i) { ret false; }
                 var k: usize = 0;
-                for (k < z::usize + 2 && i < BC) {
+                for (k < z::usize + 2) {
                     bl[i] = 0;
                     i     = i + 1;
                     k     = k + 1;
@@ -253,9 +277,11 @@ fun read_tables(u: *Unpacker) bool {
     }
     if (!build(?u.bd, ?bl[0], BC)) { ret false; }
 
-    var lens: [430]u8;
+    var lens:   [446]u8;
+    var tables: usize = TABLESB;
+    if (u.exact) { tables = TABLESX; }
     i = 0;
-    for (i < TABLES) {
+    for (i < tables) {
         if (past_end(u)) { ret false; }
         val sym: u32 = decode(u, ?u.bd);
         if (sym < 16) {
@@ -265,10 +291,11 @@ fun read_tables(u: *Unpacker) bool {
         or (sym == 16 || sym == 17) {
             if (i == 0) { ret false; }
             var n: u32 = 0;
-            if (sym == 16) { n = get_bits(u, 3) + 3; }
-            or             { n = get_bits(u, 7) + 11; }
+            if (sym == 16)             { n = get_bits(u, 3) + 3; }
+            or                         { n = get_bits(u, 7) + 11; }
+            if (n::usize > tables - i) { ret false; }
             val prev: u8 = lens[i - 1];
-            for (n > 0 && i < TABLES) {
+            for (n > 0) {
                 lens[i] = prev;
                 i       = i + 1;
                 n       = n - 1;
@@ -276,9 +303,10 @@ fun read_tables(u: *Unpacker) bool {
         }
         or (sym == 18 || sym == 19) {
             var n: u32 = 0;
-            if (sym == 18) { n = get_bits(u, 3) + 3; }
-            or             { n = get_bits(u, 7) + 11; }
-            for (n > 0 && i < TABLES) {
+            if (sym == 18)             { n = get_bits(u, 3) + 3; }
+            or                         { n = get_bits(u, 7) + 11; }
+            if (n::usize > tables - i) { ret false; }
+            for (n > 0) {
                 lens[i] = 0;
                 i       = i + 1;
                 n       = n - 1;
@@ -288,10 +316,10 @@ fun read_tables(u: *Unpacker) bool {
             ret false;
         }
     }
-    if (!build(?u.ld, ?lens[0], NC))             { ret false; }
-    if (!build(?u.dd, ?lens[NC], DC))            { ret false; }
-    if (!build(?u.ldd, ?lens[NC + DC], LDC))     { ret false; }
-    if (!build(?u.rd, ?lens[NC + DC + LDC], RC)) { ret false; }
+    if (!build(?u.ld, ?lens[0], NC))               { ret false; }
+    if (!build(?u.dd, ?lens[NC], u.dc))            { ret false; }
+    if (!build(?u.ldd, ?lens[NC + u.dc], LDC))     { ret false; }
+    if (!build(?u.rd, ?lens[NC + u.dc + LDC], RC)) { ret false; }
     u.have_tables = true;
     ret true;
 }
@@ -352,29 +380,41 @@ fun read_block(u: *Unpacker, p: *S.Packed) E.Code {
 
 # ---------------------------------------------------------------- output
 
-#[inline]
-fun put(u: *Unpacker, b: u8) {
-    u.window[(u.pos & u.wmask)::usize] = b;
-    u.pos                              = u.pos + 1;
+#[inline("always")]
+fun window_span(u: *Unpacker) u64 {
+    if (u.exact) { ret u.dict; }
+    ret u.wsize;
 }
 
-#[inline]
+#[inline("always")]
+fun wrap(u: *Unpacker, pos: u64) u64 {
+    if (u.exact) { ret pos % u.dict; }
+    ret pos & u.wmask;
+}
+
+#[inline("always")]
+fun put(u: *Unpacker, b: u8) {
+    u.window[wrap(u, u.pos)::usize] = b;
+    u.pos                           = u.pos + 1;
+}
+
+#[inline("always")]
 fun copy_match(u: *Unpacker, len: u64, dist: u64) {
     var src:  u64 = u.pos - dist;
-    val d:    u64 = u.pos & u.wmask;
-    val sidx: u64 = src & u.wmask;
+    val span: u64 = window_span(u);
+    val d:    u64 = wrap(u, u.pos);
+    val sidx: u64 = wrap(u, src);
     # the common case: no wrap, 8 bytes or more apart, slack after the end
-    if (dist >= 8 && dist <= u.pos && d + len + 8 <= u.wsize && sidx + len + 8 <= u.wsize) {
+    if (dist >= 8 && dist <= u.pos && d + len + 8 <= span && sidx + len + 8 <= span) {
         M.lz_copy8(?u.window[d::usize], ?u.window[sidx::usize], len::usize);
         u.pos = u.pos + len;
         ret;
     }
-    var n:    u64 = 0;
-    val w:    *u8 = u.window;
-    val mask: u64 = u.wmask;
+    var n: u64 = 0;
+    val w: *u8 = u.window;
     for (n < len) {
-        w[((u.pos + n) & mask)::usize] = w[((src + n) & mask)::usize];
-        n                              = n + 1;
+        w[wrap(u, u.pos + n)::usize] = w[wrap(u, src + n)::usize];
+        n                            = n + 1;
     }
     u.pos = u.pos + len;
 }
@@ -384,10 +424,11 @@ fun emit(u: *Unpacker, sink: *S.Sink, from: u64, to: u64) {
     var a: u64 = from;
     var b: u64 = to;
     if (b > u.file_end) { b = u.file_end; }
+    val span: u64 = window_span(u);
     for (a < b) {
-        val off: u64 = a & u.wmask;
+        val off: u64 = wrap(u, a);
         var n:   u64 = b - a;
-        if (n > u.wsize - off) { n = u.wsize - off; }
+        if (n > span - off) { n = span - off; }
         S.sink_write(sink, ?u.window[off::usize], n::usize);
         a = a + n;
     }
@@ -425,7 +466,7 @@ fun run_filter(u: *Unpacker, f: *Filter, sink: *S.Sink) E.Code {
             var prev: u8    = 0;
             var d:    usize = c;
             for (d < n) {
-                prev   = prev - u.window[(src & u.wmask)::usize];
+                prev   = prev - u.window[wrap(u, src)::usize];
                 out[d] = prev;
                 src    = src + 1;
                 d      = d + ch;
@@ -436,7 +477,7 @@ fun run_filter(u: *Unpacker, f: *Filter, sink: *S.Sink) E.Code {
     or {
         var i: usize = 0;
         for (i < n) {
-            out[i] = u.window[((f.start + i::u64) & u.wmask)::usize];
+            out[i] = u.window[wrap(u, f.start + i::u64)::usize];
             i      = i + 1;
         }
         if (f.kind == FILTER_E8 || f.kind == FILTER_E8E9) {
@@ -530,6 +571,14 @@ fun length_from_code(u: *Unpacker, code: u32) u64 {
     ret 2 + ((4 | (code & 3))::u64 << lbits::u64) + get_bits(u, lbits)::u64;
 }
 
+#[inline("always")]
+fun valid_distance(u: *Unpacker, dist: u64) bool {
+    # A match can only refer to bytes already decoded in this solid stream and
+    # still retained by the dictionary. In particular, zero-valued initial
+    # cache entries are not valid repeat distances.
+    ret dist != 0 && dist <= u.pos && dist <= u.dict;
+}
+
 # a filter number: 2 bits giving 1-4 bytes, then the bytes little endian
 fun filter_number(u: *Unpacker) u64 {
     val nbytes: u32 = get_bits(u, 2) + 1;
@@ -547,15 +596,17 @@ fun read_filter(u: *Unpacker) E.Code {
     val len:      u64 = filter_number(u);
     val kind:     u8  = get_bits(u, 3)::u8;
     var channels: u8  = 0;
-    if (kind == FILTER_DELTA)        { channels = get_bits(u, 5)::u8 + 1; }
-    if (kind > FILTER_ARM)           { ret E.BAD_DATA; }
-    if (len < 4 || len > MAX_FILTER) { ret E.BAD_DATA; }
-    if (u.nfilters == MAX_FILTERS)   { ret E.BAD_DATA; }
+    if (kind == FILTER_DELTA)               { channels = get_bits(u, 5)::u8 + 1; }
+    if (kind > FILTER_ARM)                  { ret E.BAD_DATA; }
+    if (len < 4 || len > MAX_FILTER)        { ret E.BAD_DATA; }
+    if (u.nfilters == MAX_FILTERS)          { ret E.BAD_DATA; }
+    if (u.pos > 0xFFFFFFFFFFFFFFFF - start) { ret E.BAD_DATA; }
     val abs: u64 = u.pos + start;
+    if (abs > 0xFFFFFFFFFFFFFFFF - len) { ret E.BAD_DATA; }
     # filters must come in order and must not overlap
     if (u.nfilters > 0) {
         val last: *Filter = ?u.filters[u.nfilters - 1];
-        if (abs < last.start + last.len) { ret E.BAD_DATA; }
+        if (last.start > 0xFFFFFFFFFFFFFFFF - last.len || abs < last.start + last.len) { ret E.BAD_DATA; }
     }
     u.filters[u.nfilters] = Filter{start: abs, len: len, kind: kind, channels: channels};
     u.nfilters            = u.nfilters + 1;
@@ -564,7 +615,7 @@ fun read_filter(u: *Unpacker) E.Code {
 
 # decode the current block to its end, flushing as the window fills
 fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
-    val room: u64 = u.wsize - MAX_MATCH;
+    val room: u64 = window_span(u) - MAX_MATCH;
     for (u.bitpos < u.end_bits) {
         if (u.pos - u.flushed >= room - MAX_MATCH) {
             val fc: E.Code = flush(u, sink);
@@ -580,7 +631,7 @@ fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
         if (sym >= 262 && sym < 0xFFFF) {
             var len:  u64 = length_from_code(u, sym - 262);
             val slot: u32 = decode(u, ?u.dd);
-            if (slot >= DC::u32) { ret E.BAD_DATA; }
+            if (slot >= u.dc::u32) { ret E.BAD_DATA; }
             var dist: u64 = 1;
             if (slot < 4) {
                 dist = dist + slot::u64;
@@ -589,7 +640,7 @@ fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
                 val dbits: u32 = slot / 2 - 1;
                 dist = dist + ((2 | (slot & 1))::u64 << dbits::u64);
                 if (dbits >= 4) {
-                    if (dbits > 4) { dist = dist + (get_bits(u, dbits - 4)::u64 << 4); }
+                    if (dbits > 4) { dist = dist + (get_bits64(u, dbits - 4) << 4); }
                     val low: u32 = decode(u, ?u.ldd);
                     if (low >= LDC::u32) { ret E.BAD_DATA; }
                     dist = dist + low::u64;
@@ -605,7 +656,7 @@ fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
                     if (dist > 0x40000) { len = len + 1; }
                 }
             }
-            if (dist > u.wsize) { ret E.BAD_DATA; }
+            if (!valid_distance(u, dist)) { ret E.BAD_DATA; }
             u.dist_cache[3] = u.dist_cache[2];
             u.dist_cache[2] = u.dist_cache[1];
             u.dist_cache[1] = u.dist_cache[0];
@@ -620,13 +671,15 @@ fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
             cnt;
         }
         if (sym == 257) {
-            if (u.last_len != 0) { copy_match(u, u.last_len, u.dist_cache[0]); }
+            if (u.last_len == 0 || !valid_distance(u, u.dist_cache[0])) { ret E.BAD_DATA; }
+            copy_match(u, u.last_len, u.dist_cache[0]);
             cnt;
         }
         if (sym >= 258 && sym < 262) {
             val idx:  usize = (sym - 258)::usize;
             val dist: u64   = u.dist_cache[idx];
-            var k:    usize = idx;
+            if (!valid_distance(u, dist)) { ret E.BAD_DATA; }
+            var k: usize = idx;
             for (k > 0) {
                 u.dist_cache[k] = u.dist_cache[k - 1];
                 k               = k - 1;
@@ -651,6 +704,7 @@ fun decode_block(u: *Unpacker, sink: *S.Sink) E.Code {
 # known:    false when the size is unknown and the stream end decides
 pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: bool) E.Code {
     if (known) {
+        if (unp_size > 0xFFFFFFFFFFFFFFFF - u.file_start) { ret E.BAD_DATA; }
         u.file_end = u.file_start + unp_size;
     }
     or {
@@ -673,4 +727,20 @@ pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: boo
     if (rc == E.OK && known && u.pos - u.file_start != unp_size) { rc = E.BAD_DATA; }
     if (rc != E.OK)                                              { u.broken = true; }
     ret rc;
+}
+
+test unpack__match_distance_needs_history {
+    var u: Unpacker;
+    init(?u);
+    u.wsize = 0x800000;
+    u.dict  = 0x20000;
+    if (valid_distance(?u, 0)) { ret 1; }
+    if (valid_distance(?u, 1)) { ret 2; }
+    u.pos = 7;
+    if (!valid_distance(?u, 7)) { ret 3; }
+    if (valid_distance(?u, 8))  { ret 4; }
+    u.pos = u.wsize + 10;
+    if (!valid_distance(?u, u.dict))    { ret 5; }
+    if (valid_distance(?u, u.dict + 1)) { ret 6; }
+    ret 0;
 }
