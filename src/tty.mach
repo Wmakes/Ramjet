@@ -14,7 +14,7 @@ use std.types.string.str;
 
 use std.system.os;
 
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     use sys: std.system.os.linux.shared;
 
     $if ($mach.build.arch == $mach.arch.x86_64) {
@@ -42,14 +42,14 @@ $if ($mach.build.os == $mach.os.linux) {
         ret sys.syscall3(SYS_IOCTL, fd::usize, request, argp);
     }
 }
-$or ($mach.build.os == $mach.os.windows) {
-    #[library("kernel32.dll")]
+$or ($mach.build.sys == $mach.sys.windows) {
+    #[library("kernel32")]
     ext fun GetStdHandle(which: u32) isize;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun GetConsoleMode(handle: isize, mode: *u32) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun SetConsoleMode(handle: isize, mode: u32) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun ReadFile(handle: isize, buf: *u8, n: u32, got: *u32, overlapped: ptr) i32;
 
     val STD_INPUT:         u32 = 0xFFFFFFF6;
@@ -60,11 +60,11 @@ $or ($mach.build.os == $mach.os.windows) {
 
 # does this standard stream (1 = stdout, 2 = stderr) go to a terminal
 pub fun is_terminal(fd: i64) bool {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         var t: Termios;
         ret ioctl(fd, TCGETS, (?t)::usize) == 0;
     }
-    $or ($mach.build.os == $mach.os.windows) {
+    $or ($mach.build.sys == $mach.sys.windows) {
         var which: u32 = STD_OUTPUT;
         if (fd == 2) { which = STD_ERROR; }
         if (fd == 0) { which = STD_INPUT; }
@@ -78,7 +78,7 @@ pub fun is_terminal(fd: i64) bool {
 
 # is there a terminal to ask questions on
 pub fun available() bool {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         var fd: usize = 0;
         if (os.open(os.working_dir(), "/dev/tty"::*u8, 2, 0, ?fd) < 0) { ret false; }
         var t:  Termios;
@@ -86,7 +86,7 @@ pub fun available() bool {
         os.close(fd);
         ret ok;
     }
-    $or ($mach.build.os == $mach.os.windows) {
+    $or ($mach.build.sys == $mach.sys.windows) {
         var mode: u32 = 0;
         ret GetConsoleMode(GetStdHandle(STD_INPUT), ?mode) != 0;
     }
@@ -102,7 +102,7 @@ pub fun available() bool {
 # hidden: do not echo what is typed (passwords)
 # ret:    answer length, or -1 when there is no terminal to ask
 pub fun prompt(question: str, buf: *u8, cap: usize, hidden: bool) i64 {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         var fd: usize = 0;
         if (os.open(os.working_dir(), "/dev/tty"::*u8, 2, 0, ?fd) < 0) { ret -1; }
         var saved: Termios;
@@ -121,7 +121,7 @@ pub fun prompt(question: str, buf: *u8, cap: usize, hidden: bool) i64 {
         os.close(fd);
         ret n;
     }
-    $or ($mach.build.os == $mach.os.windows) {
+    $or ($mach.build.sys == $mach.sys.windows) {
         val h:    isize = GetStdHandle(STD_INPUT);
         var mode: u32   = 0;
         if (GetConsoleMode(h, ?mode) == 0) { ret -1; }

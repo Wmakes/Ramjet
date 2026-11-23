@@ -9,32 +9,32 @@ use std.types.size.usize;
 
 use M: ramjet.mem;
 
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     use sys: std.system.os.linux.shared;
 }
 
-$if ($mach.build.os == $mach.os.linux && $mach.build.arch == $mach.arch.x86_64) {
+$if ($mach.build.sys == $mach.sys.linux && $mach.build.arch == $mach.arch.x86_64) {
     val SYS_LINKAT:    usize = 265;
     val SYS_FCHMODAT:  usize = 268;
     val SYS_UTIMENSAT: usize = 280;
 }
-$or ($mach.build.os == $mach.os.linux) {
+$or ($mach.build.sys == $mach.sys.linux) {
     # aarch64 and riscv64 share the generic syscall table
     val SYS_LINKAT:    usize = 37;
     val SYS_FCHMODAT:  usize = 53;
     val SYS_UTIMENSAT: usize = 88;
 }
 
-$if ($mach.build.os == $mach.os.windows) {
-    #[library("kernel32.dll")]
+$if ($mach.build.sys == $mach.sys.windows) {
+    #[library("kernel32")]
     ext fun CreateFileW(path: *u16, access: u32, share: u32, security: ptr, disposition: u32, flags: u32, template: isize) isize;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun SetFileTime(handle: isize, created: *u64, accessed: *u64, written: *u64) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun CloseHandle(handle: isize) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun CreateHardLinkW(path: *u16, existing: *u16, security: ptr) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun SetFileAttributesW(path: *u16, attributes: u32) i32;
 
     val FILE_WRITE_ATTRIBUTES:      u32   = 0x100;
@@ -107,13 +107,13 @@ fun filetime(sec: i64, nsec: u32) u64 {
 # set access and modification times of a path, not following a final
 # symbolic link; 0 on success
 pub fun set_times(path: *u8, atime_sec: i64, atime_nsec: u32, mtime_sec: i64, mtime_nsec: u32) i64 {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         var ts: [2]Timespec;
         ts[0] = Timespec{sec: atime_sec, nsec: atime_nsec::i64};
         ts[1] = Timespec{sec: mtime_sec, nsec: mtime_nsec::i64};
         ret sys.syscall4(SYS_UTIMENSAT, AT_FDCWD::usize, path::usize, (?ts[0])::usize, AT_SYMLINK_NOFOLLOW);
     }
-    $or ($mach.build.os == $mach.os.windows) {
+    $or ($mach.build.sys == $mach.sys.windows) {
         val n: usize = M.cstr_len(path);
         val w: *u16  = wide_path(path, n);
         if (w == nil) { ret -1; }
@@ -135,10 +135,10 @@ pub fun set_times(path: *u8, atime_sec: i64, atime_nsec: u32, mtime_sec: i64, mt
 
 # create a hard link `link` to the existing `target`; 0 on success
 pub fun hard_link(target: *u8, link: *u8) i64 {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         ret sys.syscall5(SYS_LINKAT, AT_FDCWD::usize, target::usize, AT_FDCWD::usize, link::usize, 0);
     }
-    $or ($mach.build.os == $mach.os.windows) {
+    $or ($mach.build.sys == $mach.sys.windows) {
         val tn: usize = M.cstr_len(target);
         val ln: usize = M.cstr_len(link);
         val wt: *u16  = wide_path(target, tn);
@@ -156,7 +156,7 @@ pub fun hard_link(target: *u8, link: *u8) i64 {
 
 # set the Unix permission bits of a path; 0 on success
 pub fun set_mode(path: *u8, mode: i32) i64 {
-    $if ($mach.build.os == $mach.os.linux) {
+    $if ($mach.build.sys == $mach.sys.linux) {
         ret sys.syscall3(SYS_FCHMODAT, AT_FDCWD::usize, path::usize, mode::usize);
     }
     $or {
@@ -166,7 +166,7 @@ pub fun set_mode(path: *u8, mode: i32) i64 {
 
 # apply Windows attributes (read-only, hidden, system, archive); 0 on success
 pub fun set_attributes(path: *u8, attr: u32) i64 {
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         val n: usize = M.cstr_len(path);
         val w: *u16  = wide_path(path, n);
         if (w == nil) { ret -1; }

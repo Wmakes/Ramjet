@@ -15,7 +15,7 @@
 # with HMAC-SHA256(hash key, value); a CRC32 is then XOR-folded back to 4
 # bytes.
 
-use sha: std.crypto.hash.sha256;
+use sha: ramjet.crypto.sha256;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;

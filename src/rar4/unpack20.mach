@@ -161,7 +161,8 @@ fun read_tables(u: *Unpacker) bool {
         or (s == 16) {
             if (i == 0) { ret false; }
             var n: u32 = BI.bits(?u.bi, 2) + 3;
-            for (n > 0 && i < count) {
+            if (n::usize > count - i) { ret false; }
+            for (n > 0) {
                 u.lengths[i] = u.lengths[i - 1];
                 i            = i + 1;
                 n            = n - 1;
@@ -169,9 +170,10 @@ fun read_tables(u: *Unpacker) bool {
         }
         or (s == 17 || s == 18) {
             var n: u32 = 0;
-            if (s == 17) { n = BI.bits(?u.bi, 3) + 3; }
-            or           { n = BI.bits(?u.bi, 7) + 11; }
-            for (n > 0 && i < count) {
+            if (s == 17)              { n = BI.bits(?u.bi, 3) + 3; }
+            or                        { n = BI.bits(?u.bi, 7) + 11; }
+            if (n::usize > count - i) { ret false; }
+            for (n > 0) {
                 u.lengths[i] = 0;
                 i            = i + 1;
                 n            = n - 1;
@@ -202,7 +204,8 @@ fun put(u: *Unpacker, b: u8) {
     u.pos                                   = u.pos + 1;
 }
 
-fun copy_match(u: *Unpacker, len: u64, dist: u64) {
+fun copy_match(u: *Unpacker, len: u64, dist: u64) bool {
+    if (dist == 0 || dist > u.pos || dist > WINDOW) { ret false; }
     val mask: u64 = WINDOW - 1;
     var n:    u64 = 0;
     for (n < len) {
@@ -210,6 +213,7 @@ fun copy_match(u: *Unpacker, len: u64, dist: u64) {
         n                                     = n + 1;
     }
     u.pos = u.pos + len;
+    ret true;
 }
 
 fun flush(u: *Unpacker, sink: *S.Sink) {
@@ -318,12 +322,13 @@ fun build_dist() {
     dist_ready = true;
 }
 
-fun match(u: *Unpacker, dist: u64, len: u64) {
+fun match(u: *Unpacker, dist: u64, len: u64) bool {
+    if (!copy_match(u, len, dist)) { ret false; }
     u.last_dist                        = dist;
     u.old_dist[(u.old_idx & 3)::usize] = dist;
     u.old_idx                          = u.old_idx + 1;
     u.last_len                         = len;
-    copy_match(u, len, dist);
+    ret true;
 }
 
 fun lz_step(u: *Unpacker) E.Code {
@@ -333,7 +338,7 @@ fun lz_step(u: *Unpacker) E.Code {
         ret E.OK;
     }
     if (s == 256) {
-        match(u, u.last_dist, u.last_len);
+        if (u.last_len == 0 || !match(u, u.last_dist, u.last_len)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s < 261) {
@@ -342,11 +347,11 @@ fun lz_step(u: *Unpacker) E.Code {
         if (lc >= RC::u32) { ret E.BAD_DATA; }
         var lx:  u32 = 0;
         var len: u64 = length_base(lc, ?lx)::u64 + 2;
-        if (lx > 0)          { len = len + BI.bits(?u.bi, lx)::u64; }
-        if (dist >= 0x40000) { len = len + 1; }
-        if (dist >= 0x2000)  { len = len + 1; }
-        if (dist >= 0x101)   { len = len + 1; }
-        match(u, dist, len);
+        if (lx > 0)               { len = len + BI.bits(?u.bi, lx)::u64; }
+        if (dist >= 0x40000)      { len = len + 1; }
+        if (dist >= 0x2000)       { len = len + 1; }
+        if (dist >= 0x101)        { len = len + 1; }
+        if (!match(u, dist, len)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s < 269) {
@@ -382,7 +387,7 @@ fun lz_step(u: *Unpacker) E.Code {
             bits = 6;
             base = 128;
         }
-        match(u, base + 1 + BI.bits(?u.bi, bits)::u64, 2);
+        if (!match(u, base + 1 + BI.bits(?u.bi, bits)::u64, 2)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s == 269) {
@@ -397,10 +402,10 @@ fun lz_step(u: *Unpacker) E.Code {
     if (slot >= DC::u32) { ret E.BAD_DATA; }
     var dist: u64 = dist_base[slot::usize] + 1;
     val dx:   u32 = dist_bits(slot);
-    if (dx > 0)          { dist = dist + BI.bits(?u.bi, dx)::u64; }
-    if (dist >= 0x40000) { len = len + 1; }
-    if (dist >= 0x2000)  { len = len + 1; }
-    match(u, dist, len);
+    if (dx > 0)               { dist = dist + BI.bits(?u.bi, dx)::u64; }
+    if (dist >= 0x40000)      { len = len + 1; }
+    if (dist >= 0x2000)       { len = len + 1; }
+    if (!match(u, dist, len)) { ret E.BAD_DATA; }
     ret E.OK;
 }
 
@@ -440,8 +445,9 @@ pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: boo
     # first bytes, so the file starts where the previous one ended
     u.file_start = u.stream_end;
     u.flushed    = u.file_start;
-    if (known) { u.file_end = u.file_start + unp_size; }
-    or         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
+    if (known && unp_size > 0xFFFFFFFFFFFFFFFF - u.file_start) { ret E.BAD_DATA; }
+    if (known)                                                 { u.file_end = u.file_start + unp_size; }
+    or                                                         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
 
     var rc: E.Code = E.OK;
     if (!u.tables_read && !read_tables(u)) { rc = E.BAD_DATA; }

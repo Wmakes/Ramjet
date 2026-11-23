@@ -18,13 +18,12 @@ The project is written in **Mach**, a systems programming language designed arou
 
 ## Independent implementation
 
-Ramjet is an independent implementation. It does not use, include, copy or
-translate source code from RAR, WinRAR, UnRAR or 7-Zip's RAR code, and uses
-no decompiled or disassembled code. Format knowledge comes from the public
-RARLAB technotes, from running `rar` as an ordinary program and checking its
-output, and from reading (without copying) the BSD-licensed libarchive and
-LGPL-licensed XADMaster RAR readers. `docs/provenance-notes.md` lists the
-source of each piece.
+Ramjet's RAR reader is independently implemented. It does not use, include,
+copy or translate source code from RAR, WinRAR, UnRAR or 7-Zip's RAR code, and
+uses no decompiled or disassembled code.Format knowledge comes from the
+public RARLAB technotes, running `rar` as an ordinary program and checking its
+output, and reading the BSD-licensed libarchive and LGPL-licensed XADMaster
+RAR readers. `docs/provenance-notes.md` lists these sources.
 ## Non-Goals
 
 Ramjet is not intended to:
@@ -40,27 +39,28 @@ Ramjet is an independent implementation.
 
 Ramjet is being built reader first; the writer comes after the reader is complete.
 
-Reading works for **RAR 5.0**, **RAR 2.9–4.x** and **RAR 2.0** archives (what RAR 2.x through 7.x create):
+Reading works across **RAR 1.3 through RAR 7** archives:
 
 * listing (`l`, `lt`), testing (`t`), extraction (`x`, `e`) and printing (`p`)
-* every compression method, solid archives, dictionaries up to 4 GB (RAR 5) and 4 MB (RAR 4)
-* RAR 5 filters (delta, x86 E8/E8E9; ARM implemented but untested) and RAR 4 filters (delta, x86, Itanium, RGB, audio)
+* every compression method, solid archives, and RAR 7 version-1 compression with non-power-of-two dictionaries
+* dictionaries up to 4 GB by default; larger RAR 7 dictionaries are enabled explicitly with `-md<N>[kmg]`
+* RAR 5 filters (delta, x86 E8/E8E9, ARM) and RAR 4 filters (delta, x86, Itanium, RGB, audio)
 * RAR 4 PPMd text compression, RAR 2.0 multimedia (audio) compression
-* RAR 1.5 compression is implemented but untested (no RAR 1.5 archives to test with)
+* the pre-1.5 `RE~^` container, RAR 1.3/1.5 compression, old checksums, comments and SFX archives
 * multi-volume archives (`.partN.rar` and `.rar`/`.r00` naming), including split solid and encrypted sets
-* encryption: AES-256 (RAR 5) and AES-128 (RAR 4), of file data and of headers, and the RAR 2.0 cipher
+* encryption: AES-256 (RAR 5), AES-128 (RAR 3/4), and the RAR 1.3, 1.5 and 2.0 ciphers
 * CRC32 and BLAKE2sp checksums, including per-volume checksums of split files
 * symbolic links, hard links, file references (`-oi`), file versions (`-ver`), SFX archives, archive comments
 * file times and Unix permissions (Linux) or attributes (Windows) are restored; set-id bits never are
-* builds for Linux, Windows and macOS (Windows tested under Wine)
+* builds and CI tests for Linux x86-64/ARM64, macOS x86-64/ARM64 and Windows x86-64
 
-Not yet: verified RAR 1.5 support, archives older than RAR 1.5, the RAR 7 version 1 algorithm (dictionaries over 4 GB), the writer.
+Not yet: restoring Windows-only NTFS ACL and alternate-stream service metadata, and the writer.
 
 See [`docs/provenance-notes.md`](docs/provenance-notes.md) for where every piece of format knowledge came from.
 
 ## Building
 
-Ramjet needs the [Mach](https://machlang.org/) compiler (6.x).
+Ramjet needs the [Mach](https://machlang.org/) compiler (7.x).
 
 ```
 git submodule update --init
@@ -104,6 +104,7 @@ switches:
   -idq, -q      only show errors and the summary
   -inul         show nothing
   -idp          no progress percentage
+  -md<N>[kmg]   allow RAR 7 dictionaries up to this size (default 4g)
   -             stop reading switches (-- works too)
 ```
 
@@ -166,9 +167,11 @@ When adding a new feature, prefer:
 
 ## Licensing
 
-Ramjet is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+Ramjet is licensed under the **GNU General Public License v3.0 (GPL-3.0)**
 
-See [`LICENSE`](LICENSE) for the complete license text. Binaries include the Mach standard library (MIT); see [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt).
+See [`LICENSE`](LICENSE) for the complete license text. Binaries include the
+Mach standard library and adapted SHA-256 code under MIT terms; see
+[`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt).
 
 This license applies to the original Ramjet source code.
 

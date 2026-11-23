@@ -120,6 +120,9 @@ pub rec Archive {
     # RAR 1.5-4.x archive
     rar4: bool;
 
+    # pre-1.5 RE~^ archive
+    rar13: bool;
+
     # RAR 1.5-4.x file headers seen, for the RAR 1.5 solid rule
     files4: usize;
 
@@ -161,17 +164,23 @@ fun close_volume(v: *Volume) {
     fs.close(?v.file);
 }
 
-# position just past the RAR5 signature, searching an SFX prefix if needed
+# position just past the signature, searching an SFX prefix if needed
 # ---
-# ret: offset after the signature, 0 when none was found; sets rar4 when it
-#      is the 7-byte RAR 1.5-4.x signature
-pub fun find_signature(p: *u8, size: usize, rar4: *bool) usize {
-    @rar4 = false;
+# ret: offset after the signature, 0 when none was found
+pub fun find_signature(p: *u8, size: usize, rar4: *bool, rar13: *bool) usize {
+    @rar4  = false;
+    @rar13 = false;
     var limit: usize = size;
     if (limit > SFX_SEARCH_LIMIT) { limit = SFX_SEARCH_LIMIT; }
     var i: usize = 0;
-    for (i + 7 <= limit) {
-        if (p[i] == 0x52 && p[i + 1] == 0x61 && p[i + 2] == 0x72 && p[i + 3] == 0x21 &&
+    for (i + 4 <= limit) {
+        if (p[i] == 0x52 && p[i + 1] == 0x45 && p[i + 2] == 0x7E && p[i + 3] == 0x5E) {
+            if (i == 0 || (size > 31 && p[28] == 'R' && p[29] == 'S' && p[30] == 'F' && p[31] == 'X')) {
+                @rar13 = true;
+                ret i + 4;
+            }
+        }
+        if (i + 7 <= limit && p[i] == 0x52 && p[i + 1] == 0x61 && p[i + 2] == 0x72 && p[i + 3] == 0x21 &&
             p[i + 4] == 0x1A && p[i + 5] == 0x07) {
             if (p[i + 6] == 0x01 && i + 8 <= size && p[i + 7] == 0x00) { ret i + 8; }
             if (p[i + 6] == 0x00) {
@@ -470,7 +479,8 @@ fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
             }
             disk = b.total;
         }
-        if (!b.crc_ok) {
+        val deferred_crc: bool = (b.htype == H4.HEAD_FILE || b.htype == H4.HEAD_NEWSUB) && (b.flags & H4.LHD_COMMENT) != 0;
+        if (!b.crc_ok && !deferred_crc) {
             # with encrypted headers a bad CRC means a wrong password
             if (ar.encrypted_headers) { ret E.BAD_PASSWORD; }
             ar.bad_headers = ar.bad_headers + 1;
@@ -500,6 +510,10 @@ fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
         or (b.htype == H4.HEAD_FILE || b.htype == H4.HEAD_NEWSUB) {
             var fh: H.FileHeader;
             if (!H4.parse_file(hp, ?b, ?fh)) { ret E.BAD_HEADER; }
+            if (!b.crc_ok) {
+                if (ar.encrypted_headers) { ret E.BAD_PASSWORD; }
+                ar.bad_headers = ar.bad_headers + 1;
+            }
             # RAR 1.5 files carry no solid flag: every file after the first
             # of a solid archive continues the stream
             if (b.htype == H4.HEAD_FILE && fh.unp_ver < 20)                      { fh.solid = ar.solid && ar.files4 > 0; }
@@ -536,18 +550,128 @@ fun scan_volume4(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
     ret E.OK;
 }
 
+# walk one pre-1.5 RE~^ volume; its marker is part of the main header
+fun scan_volume13(ar: *Archive, vi: usize, start: usize, more: *bool) E.Code {
+    @more = false;
+    val v: *Volume = ?ar.vols.data[vi];
+    if (start + 7 > v.size) { ret E.TRUNCATED; }
+    val main_size: usize = v.data[start + 4]::usize | (v.data[start + 5]::usize << 8);
+    if (main_size < 7 || start + main_size > v.size) { ret E.BAD_HEADER; }
+    val main_flags: u8 = v.data[start + 6];
+    if (vi == 0) {
+        ar.volume = (main_flags & 0x01) != 0;
+        ar.solid  = (main_flags & 0x08) != 0;
+        ar.locked = (main_flags & 0x04) != 0;
+    }
+
+    var pos:       usize = start + main_size;
+    var last_file: i64   = -1;
+    if (vi == 0 && (main_flags & 0x02) != 0 && main_size >= 9) {
+        val ext:       usize = start + 7;
+        val cmt_len:   usize = v.data[ext]::usize | (v.data[ext + 1]::usize << 8);
+        val ext_bytes: usize = main_size - 7;
+        if ((main_flags & 0x10) != 0) {
+            if (cmt_len < 2 || cmt_len + 2 > ext_bytes) { ret E.BAD_HEADER; }
+            val unp_len: u64 = (v.data[ext + 2]::u64 | (v.data[ext + 3]::u64 << 8));
+            var ch:      H.FileHeader;
+            M.zero_bytes((?ch)::*u8, $size_of(H.FileHeader));
+            ch.rar4      = true;
+            ch.unp_ver   = 13;
+            ch.unp_size  = unp_len;
+            ch.method    = 3;
+            ch.dict_size = 0x10000;
+            ch.host_os   = H.HOST_WINDOWS;
+            ch.name      = "CMT"::*u8;
+            ch.name_len  = 3;
+            val ac: E.Code = add_part(ar, vi, ?ch, true, false, false, true,
+                (ext + 4)::u64, (cmt_len - 2)::u64, ?last_file);
+            if (ac != E.OK) { ret ac; }
+        }
+        or {
+            if (cmt_len + 2 > ext_bytes) { ret E.BAD_HEADER; }
+            ar.comment     = ?v.data[ext + 2];
+            ar.comment_len = cmt_len;
+        }
+    }
+    for (pos < v.size) {
+        if (v.size - pos < 21) {
+            ar.truncated = true;
+            brk;
+        }
+        var c:         B.Cursor = B.cursor(?v.data[pos], v.size - pos);
+        val pack_size: u64      = B.read_u32(?c)::u64;
+        val unp_size:  u64      = B.read_u32(?c)::u64;
+        val checksum:  u32      = B.read_u16(?c)::u32;
+        val head_size: usize    = B.read_u16(?c)::usize;
+        val file_time: u32      = B.read_u32(?c);
+        val attr:      u8       = B.read_u8(?c);
+        val flags:     u8       = B.read_u8(?c);
+        val raw_ver:   u8       = B.read_u8(?c);
+        val name_len:  usize    = B.read_u8(?c)::usize;
+        val method:    u8       = B.read_u8(?c);
+        if (c.bad || name_len == 0 || method > 5 || head_size < 21 + name_len || head_size > v.size - pos) {
+            ret E.BAD_HEADER;
+        }
+        val data_pos: u64 = (pos + head_size)::u64;
+        if (pack_size > v.size::u64 - data_pos) {
+            ar.truncated = true;
+            brk;
+        }
+
+        var fh: H.FileHeader;
+        M.zero_bytes((?fh)::*u8, $size_of(H.FileHeader));
+        fh.rar4    = true;
+        fh.unp_ver = 10;
+        if (raw_ver == 2) { fh.unp_ver = 13; }
+        fh.unp_size  = unp_size;
+        fh.attr      = attr::u64;
+        fh.mtime     = H4.dos_time(file_time);
+        fh.data_crc  = checksum;
+        fh.method    = method::u64;
+        fh.solid     = (flags & 0x10) != 0 || (ar.solid && ar.files4 > 0);
+        fh.dict_size = 0x10000;
+        fh.host_os   = H.HOST_WINDOWS;
+        fh.name      = M.dup(?v.data[pos + 21], name_len);
+        if (fh.name == nil) { ret E.NO_MEMORY; }
+        fh.name_len = name_len;
+        var ni: usize = 0;
+        for (ni < name_len) {
+            if (fh.name[ni] == '\\') { fh.name[ni] = '/'; }
+            ni = ni + 1;
+        }
+        if ((attr & 0x10) != 0) { fh.flags = fh.flags | H.FHFL_DIRECTORY; }
+        fh.crypt.present = (flags & 0x04) != 0;
+        fh.crypt.rar4    = true;
+        fh.crypt.version = 13;
+
+        if ((flags & 0x01) == 0) { ar.files4 = ar.files4 + 1; }
+
+        val ac: E.Code = add_part(ar, vi, ?fh, false, (flags & 0x01) != 0, (flags & 0x02) != 0,
+            true, data_pos, pack_size, ?last_file);
+        if (ac != E.OK) { ret ac; }
+        pos = (data_pos + pack_size)::usize;
+    }
+    if (ar.volume && !ar.truncated && ar.open_split >= 0) { @more = true; }
+    ret E.OK;
+}
+
 # walk the headers of one volume
 # ---
 # ret: OK; `more` is set when the end header announces another volume
 fun scan_volume(ar: *Archive, vi: usize, more: *bool) E.Code {
     @more = false;
-    val v:    *Volume = ?ar.vols.data[vi];
-    var rar4: bool    = false;
-    var pos:  usize   = find_signature(v.data, v.size, ?rar4);
-    if (pos == 0)        { ret E.NOT_RAR; }
-    if (vi == 0)         { ar.rar4 = rar4; }
-    if (rar4 != ar.rar4) { ret E.NOT_RAR; }
-    if (rar4)            { ret scan_volume4(ar, vi, pos, more); }
+    val v:     *Volume = ?ar.vols.data[vi];
+    var rar4:  bool    = false;
+    var rar13: bool    = false;
+    var pos:   usize   = find_signature(v.data, v.size, ?rar4, ?rar13);
+    if (pos == 0) { ret E.NOT_RAR; }
+    if (vi == 0) {
+        ar.rar4  = rar4;
+        ar.rar13 = rar13;
+    }
+    if (rar4 != ar.rar4 || rar13 != ar.rar13) { ret E.NOT_RAR; }
+    if (rar13)                                { ret scan_volume13(ar, vi, pos - 4, more); }
+    if (rar4)                                 { ret scan_volume4(ar, vi, pos, more); }
 
     var seen_main: bool = false;
     var last_file: i64  = -1;
@@ -711,6 +835,7 @@ pub fun open(ar: *Archive, path: *u8, password: *u8) E.Code {
     ar.comment_len         = 0;
     ar.open_split          = -1;
     ar.rar4                = false;
+    ar.rar13               = false;
     ar.head4_valid         = false;
     ar.files4              = 0;
 
@@ -789,5 +914,32 @@ test archive__volume_names {
     if (!M.cstr_eq(d, "x.r00"::*u8)) { ret 4; }
     val e: *u8 = next_volume_name("x.r09"::*u8);
     if (!M.cstr_eq(e, "x.r10"::*u8)) { ret 5; }
+    ret 0;
+}
+
+test archive__rar13_signature {
+    var bare: [8]u8;
+    M.zero_bytes(?bare[0], 8);
+    bare[0] = 'R';
+    bare[1] = 'E';
+    bare[2] = '~';
+    bare[3] = '^';
+    var rar4:  bool = false;
+    var rar13: bool = false;
+    if (find_signature(?bare[0], 8, ?rar4, ?rar13) != 4 || rar4 || !rar13) { ret 1; }
+
+    # An embedded short marker is ignored without the historical RSFX guard.
+    var fake: [40]u8;
+    M.zero_bytes(?fake[0], 40);
+    fake[8]  = 'R';
+    fake[9]  = 'E';
+    fake[10] = '~';
+    fake[11] = '^';
+    if (find_signature(?fake[0], 40, ?rar4, ?rar13) != 0) { ret 2; }
+    fake[28] = 'R';
+    fake[29] = 'S';
+    fake[30] = 'F';
+    fake[31] = 'X';
+    if (find_signature(?fake[0], 40, ?rar4, ?rar13) != 12 || !rar13) { ret 3; }
     ret 0;
 }

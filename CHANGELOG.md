@@ -4,6 +4,28 @@ Versions follow [semantic versioning](https://semver.org). The version in
 `mach.toml` is the release; each release is the git tag `vX.Y.Z`, which is
 also what a Mach project depending on Ramjet pins (`ref = "tag/vX.Y.Z"`).
 
+## 0.5.0
+
+- Update to Mach 7 and mach-std 10.
+- Vendor the portable SHA-256 implementation from mach-crypto under its MIT
+  license, without adding a runtime dependency.
+- Reader support for the pre-1.5 `RE~^` container: RAR 1.3 compression and
+  encryption, its rolling 16-bit checksum, solid and multi-volume archives,
+  directories, SFX archives and packed archive comments.
+- RAR 1.5 support is now verified against real WinRAR 1.54 archives,
+  including encryption, SFX, solid data and multi-volume streams.
+- RAR 7 compression algorithm version 1: 80 distance codes, distances up to
+  1 TB and non-power-of-two dictionaries. Allocations over 4 GB require an
+  explicit `-md<N>[kmg]` limit.
+- RAR 5 ARM filtering is verified against a public ARM fixture.
+- Forward-compatible RAR 5 main headers can contain trailing fields after
+  their known extra records.
+- Reject invalid match distances before they can read unwritten dictionary
+  bytes, reject overflowing Huffman length runs and guard output/filter range
+  arithmetic in every decoder generation.
+- Fix RAR 1.5 multi-volume checksum placeholders and RAR 2.x file headers
+  carrying old inline comments.
+
 ## 0.3.7 — 2026-10-27
 
 - Reader switches modeled on observed UnRAR 7.23 behavior (it was run as an

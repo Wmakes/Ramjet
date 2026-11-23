@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       mach_version:
-        description: "Mach compiler version, e.g. 6.10.1 (empty = latest)"
+        description: "Mach compiler version, e.g. 7.0.0 (empty = latest)"
         required: false
         type: string
         default: ""

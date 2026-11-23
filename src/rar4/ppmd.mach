@@ -82,126 +82,126 @@ pub rec Model {
 
 # ---------------------------------------------------------------- heap access
 
-#[inline]
+#[inline("always")]
 fun rd8(m: *Model, o: u32) u32 {
     ret m.base[o::usize]::u32;
 }
 
-#[inline]
+#[inline("always")]
 fun wr8(m: *Model, o: u32, v: u32) {
     m.base[o::usize] = (v & 0xFF)::u8;
 }
 
 # the heap's 16- and 32-bit fields are unaligned; every supported target
 # (x86-64, AArch64) loads and stores them directly
-#[inline]
+#[inline("always")]
 fun rd16(m: *Model, o: u32) u32 {
     val p: *u16 = (?m.base[o::usize])::*u16;
     ret (@p)::u32;
 }
 
-#[inline]
+#[inline("always")]
 fun wr16(m: *Model, o: u32, v: u32) {
     val p: *u16 = (?m.base[o::usize])::*u16;
     @p = (v & 0xFFFF)::u16;
 }
 
-#[inline]
+#[inline("always")]
 fun rd32(m: *Model, o: u32) u32 {
     val p: *u32 = (?m.base[o::usize])::*u32;
     ret @p;
 }
 
-#[inline]
+#[inline("always")]
 fun wr32(m: *Model, o: u32, v: u32) {
     val p: *u32 = (?m.base[o::usize])::*u32;
     @p = v;
 }
 
 # context fields
-#[inline]
+#[inline("always")]
 fun num_stats(m: *Model, c: u32) u32 {
     ret rd16(m, c);
 }
 
-#[inline]
+#[inline("always")]
 fun set_num_stats(m: *Model, c: u32, v: u32) {
     wr16(m, c, v);
 }
 
-#[inline]
+#[inline("always")]
 fun summ_freq(m: *Model, c: u32) u32 {
     ret rd16(m, c + 2);
 }
 
-#[inline]
+#[inline("always")]
 fun set_summ_freq(m: *Model, c: u32, v: u32) {
     wr16(m, c + 2, v);
 }
 
-#[inline]
+#[inline("always")]
 fun stats(m: *Model, c: u32) u32 {
     ret rd32(m, c + 4);
 }
 
-#[inline]
+#[inline("always")]
 fun set_stats(m: *Model, c: u32, v: u32) {
     wr32(m, c + 4, v);
 }
 
-#[inline]
+#[inline("always")]
 fun suffix(m: *Model, c: u32) u32 {
     ret rd32(m, c + 8);
 }
 
-#[inline]
+#[inline("always")]
 fun set_suffix(m: *Model, c: u32, v: u32) {
     wr32(m, c + 8, v);
 }
 
-#[inline]
+#[inline("always")]
 fun one_state(c: u32) u32 {
     ret c + 2;
 }
 
 # state fields
-#[inline]
+#[inline("always")]
 fun sym(m: *Model, s: u32) u32 {
     ret rd8(m, s);
 }
 
-#[inline]
+#[inline("always")]
 fun set_sym(m: *Model, s: u32, v: u32) {
     wr8(m, s, v);
 }
 
-#[inline]
+#[inline("always")]
 fun freq(m: *Model, s: u32) u32 {
     ret rd8(m, s + 1);
 }
 
-#[inline]
+#[inline("always")]
 fun set_freq(m: *Model, s: u32, v: u32) {
     wr8(m, s + 1, v);
 }
 
-#[inline]
+#[inline("always")]
 fun successor(m: *Model, s: u32) u32 {
     ret rd32(m, s + 2);
 }
 
-#[inline]
+#[inline("always")]
 fun set_successor(m: *Model, s: u32, v: u32) {
     wr32(m, s + 2, v);
 }
 
-#[inline]
+#[inline("always")]
 fun copy_state(m: *Model, dst: u32, src: u32) {
     wr32(m, dst, rd32(m, src));
     wr16(m, dst + 4, rd16(m, src + 4));
 }
 
-#[inline]
+#[inline("always")]
 fun swap_states(m: *Model, a: u32, b: u32) {
     val a0: u32 = rd32(m, a);
     val a1: u32 = rd16(m, a + 4);
@@ -211,17 +211,17 @@ fun swap_states(m: *Model, a: u32, b: u32) {
     wr16(m, b + 4, a1);
 }
 
-#[inline]
+#[inline("always")]
 fun u2b(nu: u32) u32 {
     ret nu * UNIT;
 }
 
-#[inline]
+#[inline("always")]
 fun u2i(m: *Model, nu: u32) u32 {
     ret m.units2indx[(nu - 1)::usize]::u32;
 }
 
-#[inline]
+#[inline("always")]
 fun i2u(m: *Model, i: u32) u32 {
     ret m.indx2units[i::usize]::u32;
 }
@@ -936,7 +936,7 @@ pub fun range_init(m: *Model, input: *BI.BitIn) bool {
     ret m.code < 0xFFFFFFFF;
 }
 
-#[inline]
+#[inline("always")]
 fun threshold(m: *Model, total: u32) u32 {
     # a corrupt stream can shrink the range below the total; answer with a
     # count no symbol matches, which the decoder reports as damage
@@ -960,7 +960,7 @@ fun normalize(m: *Model) {
     }
 }
 
-#[inline]
+#[inline("always")]
 fun rc_decode(m: *Model, start: u32, size: u32) {
     m.low   = m.low + start * m.range;
     m.range = m.range * size;
@@ -979,7 +979,7 @@ fun rc_bit(m: *Model, size0: u32) u32 {
 
 # ---------------------------------------------------------------- decoding
 
-#[inline]
+#[inline("always")]
 fun get_mean(prob: u32) u32 {
     ret (prob + (1::u32 << (PERIOD_BITS - 2))) >> PERIOD_BITS;
 }

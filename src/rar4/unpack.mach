@@ -168,7 +168,7 @@ pub fun dnit(u: *Unpacker) {
 
 # ---------------------------------------------------------------- tables
 
-#[inline]
+#[inline("always")]
 fun decode(u: *Unpacker, h: *HF.Huff) u32 {
     val r: u32 = HF.lookup(h, BI.peek16(?u.bi));
     BI.skip(?u.bi, r >> 16);
@@ -194,8 +194,9 @@ fun read_lz_tables(u: *Unpacker) bool {
                 i     = i + 1;
             }
             or {
+                if (z::usize + 2 > BC - i) { ret false; }
                 var k: usize = 0;
-                for (k < z::usize + 2 && i < BC) {
+                for (k < z::usize + 2) {
                     bl[i] = 0;
                     i     = i + 1;
                     k     = k + 1;
@@ -220,9 +221,10 @@ fun read_lz_tables(u: *Unpacker) bool {
         or (s == 16 || s == 17) {
             if (i == 0) { ret false; }
             var n: u32 = 0;
-            if (s == 16) { n = BI.bits(?u.bi, 3) + 3; }
-            or           { n = BI.bits(?u.bi, 7) + 11; }
-            for (n > 0 && i < TABLES) {
+            if (s == 16)               { n = BI.bits(?u.bi, 3) + 3; }
+            or                         { n = BI.bits(?u.bi, 7) + 11; }
+            if (n::usize > TABLES - i) { ret false; }
+            for (n > 0) {
                 u.lengths[i] = u.lengths[i - 1];
                 i            = i + 1;
                 n            = n - 1;
@@ -230,9 +232,10 @@ fun read_lz_tables(u: *Unpacker) bool {
         }
         or (s == 18 || s == 19) {
             var n: u32 = 0;
-            if (s == 18) { n = BI.bits(?u.bi, 3) + 3; }
-            or           { n = BI.bits(?u.bi, 7) + 11; }
-            for (n > 0 && i < TABLES) {
+            if (s == 18)               { n = BI.bits(?u.bi, 3) + 3; }
+            or                         { n = BI.bits(?u.bi, 7) + 11; }
+            if (n::usize > TABLES - i) { ret false; }
+            for (n > 0) {
                 u.lengths[i] = 0;
                 i            = i + 1;
                 n            = n - 1;
@@ -293,14 +296,15 @@ fun read_tables(u: *Unpacker) bool {
 
 # ---------------------------------------------------------------- output
 
-#[inline]
+#[inline("always")]
 fun put(u: *Unpacker, b: u8) {
     u.window[(u.pos & (WINDOW - 1))::usize] = b;
     u.pos                                   = u.pos + 1;
 }
 
-#[inline]
-fun copy_match(u: *Unpacker, len: u64, dist: u64) {
+#[inline("always")]
+fun copy_match(u: *Unpacker, len: u64, dist: u64) bool {
+    if (dist == 0 || dist > u.pos || dist > WINDOW) { ret false; }
     val mask: u64 = WINDOW - 1;
     val w:    *u8 = u.window;
     val d:    u64 = u.pos & mask;
@@ -308,7 +312,7 @@ fun copy_match(u: *Unpacker, len: u64, dist: u64) {
     if (dist >= 8 && dist <= u.pos && d + len + 8 <= WINDOW && sidx + len + 8 <= WINDOW) {
         M.lz_copy8(?w[d::usize], ?w[sidx::usize], len::usize);
         u.pos = u.pos + len;
-        ret;
+        ret true;
     }
     var n: u64 = 0;
     for (n < len) {
@@ -316,6 +320,7 @@ fun copy_match(u: *Unpacker, len: u64, dist: u64) {
         n                              = n + 1;
     }
     u.pos = u.pos + len;
+    ret true;
 }
 
 fun emit(u: *Unpacker, sink: *S.Sink, from: u64, to: u64) {
@@ -917,7 +922,7 @@ fun lz_step(u: *Unpacker) E.Code {
         push_dist(u, dist);
         u.last_dist = dist;
         u.last_len  = len;
-        copy_match(u, len, dist);
+        if (!copy_match(u, len, dist)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s == 256) {
@@ -934,7 +939,7 @@ fun lz_step(u: *Unpacker) E.Code {
     }
     if (s == 257) { ret read_filter_lz(u); }
     if (s == 258) {
-        if (u.last_len != 0) { copy_match(u, u.last_len, u.last_dist); }
+        if (u.last_len == 0 || !copy_match(u, u.last_len, u.last_dist)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s < 263) {
@@ -953,7 +958,7 @@ fun lz_step(u: *Unpacker) E.Code {
         u.old_dist[0] = dist;
         u.last_dist   = dist;
         u.last_len    = len;
-        copy_match(u, len, dist);
+        if (!copy_match(u, len, dist)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (s < 271) {
@@ -997,7 +1002,7 @@ fun lz_step(u: *Unpacker) E.Code {
         push_dist(u, dist);
         u.last_dist = dist;
         u.last_len  = 2;
-        copy_match(u, 2, dist);
+        if (!copy_match(u, 2, dist)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     ret E.BAD_DATA;
@@ -1033,15 +1038,15 @@ fun ppm_step(u: *Unpacker) E.Code {
             i    = i + 1;
         }
         val len: u64 = ppm_byte(u, ?ok)::u64 + 32;
-        if (!ok) { ret E.BAD_DATA; }
-        copy_match(u, len, dist + 2);
+        if (!ok)                           { ret E.BAD_DATA; }
+        if (!copy_match(u, len, dist + 2)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (cmd == 5) {
         var ok:  bool = true;
         val len: u64  = ppm_byte(u, ?ok)::u64 + 4;
-        if (!ok) { ret E.BAD_DATA; }
-        copy_match(u, len, 1);
+        if (!ok)                    { ret E.BAD_DATA; }
+        if (!copy_match(u, len, 1)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     # 1, and anything else: the escape byte itself
@@ -1069,8 +1074,9 @@ pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: boo
     }
     if (!BI.init(?u.bi, p)) { ret E.NO_MEMORY; }
     u.file_start = u.pos;
-    if (known) { u.file_end = u.pos + unp_size; }
-    or         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
+    if (known && unp_size > 0xFFFFFFFFFFFFFFFF - u.pos) { ret E.BAD_DATA; }
+    if (known)                                          { u.file_end = u.pos + unp_size; }
+    or                                                  { u.file_end = 0xFFFFFFFFFFFFFFFF; }
     u.nfilters = 0;
     u.ended    = false;
 

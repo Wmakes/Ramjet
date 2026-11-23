@@ -67,6 +67,7 @@ fun usage() {
     print.println("  -idq, -q      only show errors and the summary");
     print.println("  -inul         show nothing");
     print.println("  -idp          no progress percentage");
+    print.println("  -md<N>[kmg]   allow RAR 7 dictionaries up to this size (default 4g)");
     print.println("  -             stop reading switches (-- works too)");
     print.println("  -h, --help    this help;  --version  version");
     print.println("");
@@ -91,12 +92,39 @@ fun starts(a: *u8, prefix: str) bool {
 }
 
 fun is_sep(c: u8) bool {
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         ret c == '/' || c == '\\';
     }
     $or {
         ret c == '/';
     }
+}
+
+fun parse_memory_size(s: *u8, out: *u64) bool {
+    if (s[0] < '0' || s[0] > '9') { ret false; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (s[i] >= '0' && s[i] <= '9') {
+        val digit: u64 = (s[i] - '0')::u64;
+        if (value > (0xFFFFFFFFFFFFFFFF - digit) / 10) { ret false; }
+        value = value * 10 + digit;
+        i     = i + 1;
+    }
+    var scale: u64 = 1;
+    if (s[i] != 0) {
+        val suffix: u8 = s[i] | 0x20;
+        if (suffix == 'k') { scale = 1024; }
+        or (suffix == 'm') { scale = 1024 * 1024; }
+        or (suffix == 'g') { scale = 1024 * 1024 * 1024; }
+        or (suffix == 't') { scale = 1024 * 1024 * 1024 * 1024; }
+        or                 { ret false; }
+        i = i + 1;
+        if (s[i] == 'b' || s[i] == 'B') { i = i + 1; }
+        if (s[i] != 0)                  { ret false; }
+    }
+    if (value == 0 || value > 0xFFFFFFFFFFFFFFFF / scale) { ret false; }
+    @out = value * scale;
+    ret true;
 }
 
 # append the lines of a list file (one name or mask per line) to v
@@ -337,7 +365,10 @@ fun main(argc: i64, argv: **u8) i64 {
             }
             or (M.cstr_eq(a, "-inul"::*u8)) { opt.quiet = X.QUIET_ALL; }
             or (M.cstr_eq(a, "-idp"::*u8))  { opt.progress = false; }
-            or                              { ret bad_usage("unknown switch", a); }
+            or (starts(a, "-md") && a[3] != 0) {
+                if (!parse_memory_size(?a[3], ?opt.max_dict)) { ret bad_usage("invalid dictionary limit", a); }
+            }
+            or { ret bad_usage("unknown switch", a); }
             cnt;
         }
         if (archive == nil) {

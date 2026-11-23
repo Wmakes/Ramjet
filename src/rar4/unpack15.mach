@@ -275,7 +275,8 @@ fun put(u: *Unpacker, b: u8) {
     u.pos                                   = u.pos + 1;
 }
 
-fun copy_match(u: *Unpacker, dist: u64, len: u64) {
+fun copy_match(u: *Unpacker, dist: u64, len: u64) bool {
+    if (dist == 0 || dist > u.pos || dist > WINDOW) { ret false; }
     val mask: u64 = WINDOW - 1;
     var n:    u64 = 0;
     for (n < len) {
@@ -283,6 +284,7 @@ fun copy_match(u: *Unpacker, dist: u64, len: u64) {
         n                                     = n + 1;
     }
     u.pos = u.pos + len;
+    ret true;
 }
 
 fun flush(u: *Unpacker, sink: *S.Sink) {
@@ -341,7 +343,7 @@ fun literal(u: *Unpacker) E.Code {
             val hi: u32 = decode(u, ?u.h2);
             if (hi > 256) { ret E.BAD_DATA; }
             val dist: u64 = ((hi << 5) | BI.bits(?u.bi, 5))::u64;
-            copy_match(u, dist, len);
+            if (!copy_match(u, dist, len)) { ret E.BAD_DATA; }
             ret E.OK;
         }
         idx = idx - 1;
@@ -411,7 +413,7 @@ fun long_match(u: *Unpacker) E.Code {
     }
 
     remember(u, dist::u64, len::u64);
-    copy_match(u, dist::u64, len::u64);
+    if (!copy_match(u, dist::u64, len::u64)) { ret E.BAD_DATA; }
     ret E.OK;
 }
 
@@ -419,7 +421,7 @@ fun short_match(u: *Unpacker) E.Code {
     u.rep_literals = 0;
     if (u.rep_matches == 2) {
         if (bit(u) != 0) {
-            copy_match(u, u.last_dist, u.last_len);
+            if (u.last_len == 0 || !copy_match(u, u.last_dist, u.last_len)) { ret E.BAD_DATA; }
             ret E.OK;
         }
         u.rep_matches = 0;
@@ -450,12 +452,12 @@ fun short_match(u: *Unpacker) E.Code {
         dist = dist + 1;
         val len: u64 = (sel_ + 2)::u64;
         remember(u, dist::u64, len);
-        copy_match(u, dist::u64, len);
+        if (!copy_match(u, dist::u64, len)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (sel_ == 9) {
         u.rep_matches = u.rep_matches + 1;
-        copy_match(u, u.last_dist, u.last_len);
+        if (u.last_len == 0 || !copy_match(u, u.last_dist, u.last_len)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     if (sel_ < 14) {
@@ -472,7 +474,7 @@ fun short_match(u: *Unpacker) E.Code {
         if (dist > 256)                { len = len + 1; }
         if (dist >= u.max_offset::u64) { len = len + 1; }
         remember(u, dist, len);
-        copy_match(u, dist, len);
+        if (!copy_match(u, dist, len)) { ret E.BAD_DATA; }
         ret E.OK;
     }
     # 14: a far match
@@ -483,7 +485,7 @@ fun short_match(u: *Unpacker) E.Code {
     val dist: u64 = BI.bits(?u.bi, 15)::u64 + 0x8000;
     u.last_dist = dist;
     u.last_len  = len;
-    copy_match(u, dist, len);
+    if (!copy_match(u, dist, len)) { ret E.BAD_DATA; }
     ret E.OK;
 }
 
@@ -530,8 +532,9 @@ pub fun run(u: *Unpacker, p: *S.Packed, sink: *S.Sink, unp_size: u64, known: boo
     u.rep_matches = 0;
     u.file_start  = u.stream_end;
     u.flushed     = u.file_start;
-    if (known) { u.file_end = u.file_start + unp_size; }
-    or         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
+    if (known && unp_size > 0xFFFFFFFFFFFFFFFF - u.file_start) { ret E.BAD_DATA; }
+    if (known)                                                 { u.file_end = u.file_start + unp_size; }
+    or                                                         { u.file_end = 0xFFFFFFFFFFFFFFFF; }
 
     var rc: E.Code = E.OK;
     for (rc == E.OK && u.pos < u.file_end) {

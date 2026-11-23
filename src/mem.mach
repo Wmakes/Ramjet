@@ -26,7 +26,7 @@ pub fun init() bool {
     heap.native_source(?g_source);
     val hi: err[A.Error] = heap.init(?g_heap, ?g_source, 0);
     if (sel hi.err) { ret false; }
-    val mk: err[A.Error] = heap.make(?g_alloc, ?g_heap);
+    val mk: err[A.Error] = heap.allocator(?g_alloc, ?g_heap);
     if (sel mk.err) { ret false; }
     g_ready = true;
     ret true;
@@ -65,7 +65,7 @@ pub fun zero_bytes(p: *u8, n: usize) {
 # copy an LZ match of len bytes from src to dst = src + dist, 8 bytes at a
 # time; needs dist >= 8 and may write up to 7 bytes past dst + len (callers
 # keep that slack free). reads never pass bytes this copy has not written.
-#[inline]
+#[inline("always")]
 pub fun lz_copy8(dst: *u8, src: *u8, len: usize) {
     var i: usize = 0;
     for (i < len) {
